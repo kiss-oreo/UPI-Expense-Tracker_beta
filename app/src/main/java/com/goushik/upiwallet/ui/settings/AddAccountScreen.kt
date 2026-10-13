@@ -47,6 +47,7 @@ import com.goushik.upiwallet.ui.common.PrimaryButton
 import com.goushik.upiwallet.ui.common.WalletTextField
 import com.goushik.upiwallet.ui.theme.GreenCredit
 import com.goushik.upiwallet.ui.theme.HairlineColor
+import com.goushik.upiwallet.ui.theme.RedDebit
 import com.goushik.upiwallet.ui.theme.TextPrimary
 import com.goushik.upiwallet.ui.theme.TextSecondary
 import com.goushik.upiwallet.ui.theme.TextTertiary

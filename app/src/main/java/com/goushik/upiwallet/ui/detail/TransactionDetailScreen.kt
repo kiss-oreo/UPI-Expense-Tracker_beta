@@ -44,7 +44,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.Direction
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
+import com.goushik.upiwallet.data.TxnKind
+import com.goushik.upiwallet.domain.AccountMatch
 import com.goushik.upiwallet.data.RawEventEntity
 import com.goushik.upiwallet.data.Source
 import com.goushik.upiwallet.data.TransactionEntity
@@ -99,6 +103,8 @@ private sealed interface DetailState {
         val ownNames: Set<String>,
         /** txn id → package of the UPI app whose screen created it, so each row names its real app. */
         val appOf: Map<String, String>,
+        val accounts: List<BalanceAnchorEntity>,
+        val instruments: List<PaymentInstrumentEntity>,
     ) : DetailState
 }
 
@@ -137,7 +143,7 @@ private val AmountBig = TextStyle(
  * that is already removed shows "Put back" instead.
  */
 @Composable
-fun TransactionDetailScreen(txnId: String, onBack: () -> Unit) {
+fun TransactionDetailScreen(txnId: String, onBack: () -> Unit, onEdit: (String) -> Unit = {}) {
     BackHandler { onBack() }
     val state by produceState<DetailState>(DetailState.Loading, txnId) {
         val repo = ServiceLocator.repository
@@ -148,9 +154,11 @@ fun TransactionDetailScreen(txnId: String, onBack: () -> Unit) {
         // One-shot snapshot for the duplicate-twin glance (a human backstop — staleness is harmless).
         val all = repo.transactions()
         val appOf = repo.captureApps()
+        val accounts = repo.anchors()
+        val instruments = repo.instruments()
         repo.observeTransactionById(txnId).collect { txn ->
             value = if (txn == null) DetailState.NotFound
-            else DetailState.Loaded(txn, raws, all, ownVpas, ownNames, appOf)
+            else DetailState.Loaded(txn, raws, all, ownVpas, ownNames, appOf, accounts, instruments)
         }
     }
 
@@ -162,7 +170,7 @@ fun TransactionDetailScreen(txnId: String, onBack: () -> Unit) {
         when (val s = state) {
             DetailState.Loading -> CenterNote("Loading…")
             DetailState.NotFound -> CenterNote("Transaction not found")
-            is DetailState.Loaded -> ReceiptBody(s)
+            is DetailState.Loaded -> ReceiptBody(s, onEdit)
         }
         Spacer(Modifier.height(28.dp))
     }
@@ -183,7 +191,7 @@ private fun BackBar(onBack: () -> Unit) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ReceiptBody(s: DetailState.Loaded) {
+private fun ReceiptBody(s: DetailState.Loaded, onEdit: (String) -> Unit) {
     val txn = s.txn
     val isSelf = BalanceCalculator.isSelfTransfer(txn, s.ownVpas, s.ownNames)
     val isPerson = Payee.isPerson(txn.payeeName, txn.payeeVpa) && !isSelf
@@ -258,8 +266,9 @@ private fun ReceiptBody(s: DetailState.Loaded) {
     }
 
     Spacer(Modifier.height(8.dp))
-    CategorySection(txn)
-    FactsSection(txn, s.raws)
+    if (txn.kind != TxnKind.TRANSFER) CategorySection(txn)
+    FactsSection(txn, s.raws, s.accounts)
+    AttributionSection(txn, s.accounts, s.instruments, onEdit)
     RemoveSection(
         state = removeStateFor(removed, undo),
         onRemove = { remove(false) },
@@ -436,13 +445,101 @@ private fun CategoryChip(label: String, selected: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun FactsSection(txn: TransactionEntity, raws: List<RawEventEntity>) {
+private fun FactsSection(txn: TransactionEntity, raws: List<RawEventEntity>, accounts: List<BalanceAnchorEntity>) {
     Column(Modifier.fillMaxWidth().padding(top = 6.dp)) {
         FactRow("When", DateTime.full(txn.timestampEvent))
         LocationRow(txn)
-        FactRow("Account", accountLabel(txn))
+        val assigned = accounts.firstOrNull { it.id == txn.accountId }
+        val guessed = AccountMatch.resolve(txn, accounts)?.let { id -> accounts.firstOrNull { it.id == id } }
+        FactRow(if (txn.kind == TxnKind.TRANSFER) "From" else "Account",
+            assigned?.accountLabel ?: guessed?.accountLabel?.let { "$it · suggested" } ?: accountLabel(txn))
+        if (txn.kind == TxnKind.TRANSFER) {
+            FactRow("To", accounts.firstOrNull { it.id == txn.toAccountId }?.accountLabel ?: "Account removed")
+        }
         FactRow("Reference", txn.rrn ?: "—")
         OriginalMessageRow(raws)
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AttributionSection(
+    txn: TransactionEntity,
+    accounts: List<BalanceAnchorEntity>,
+    instruments: List<PaymentInstrumentEntity>,
+    onEdit: (String) -> Unit,
+) {
+    if (txn.status == TxnStatus.DISCARDED) return
+    SectionDivider()
+    Column(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+        Text("Account & notes", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+        if (txn.source == Source.MANUAL) {
+            if (!txn.note.isNullOrBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(txn.note, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+            }
+            Spacer(Modifier.height(12.dp))
+            Text("Edit amount, type, date, account or note", color = TextPrimary,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.clickable { onEdit(txn.id) }.padding(vertical = 8.dp))
+        } else {
+            var selectedAccount by remember(txn.id, txn.accountId) { mutableStateOf(txn.accountId) }
+            var selectedInstrument by remember(txn.id, txn.instrumentId) { mutableStateOf(txn.instrumentId) }
+            var note by remember(txn.id, txn.note) { mutableStateOf(txn.note.orEmpty()) }
+            var error by remember(txn.id) { mutableStateOf<String?>(null) }
+            Spacer(Modifier.height(9.dp))
+            Text("Assign a captured payment to one real account. Bank hints are suggestions only; " +
+                "UPI IDs linked to a bank never have a separate balance.",
+                color = TextTertiary, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(12.dp))
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                accounts.forEach { a ->
+                    CategoryChip(a.accountLabel + (a.accountLast4?.let { " ••$it" } ?: ""),
+                        selectedAccount == a.id) {
+                        selectedAccount = a.id; selectedInstrument = null
+                    }
+                }
+            }
+            val linked = instruments.filter { it.accountId == selectedAccount }
+            if (linked.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    linked.forEach { i ->
+                        CategoryChip(i.label, selectedInstrument == i.id) {
+                            selectedInstrument = if (selectedInstrument == i.id) null else i.id
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            WalletTextField(note, { note = it.take(500) }, placeholder = "Private note (optional)", singleLine = false)
+            error?.let { Text(it, color = RedDebit, style = MaterialTheme.typography.bodySmall) }
+            Spacer(Modifier.height(10.dp))
+            Text("Save account & note", color = TextPrimary,
+                modifier = Modifier.clickable {
+                    val account = selectedAccount
+                    val instrument = selectedInstrument
+                    val savedNote = note
+                    ServiceLocator.appScope.launch {
+                        runCatching { ServiceLocator.repository.setAttribution(txn.id, account, instrument, savedNote) }
+                            .onFailure { error = it.message ?: "Couldn't save details" }
+                    }
+                }.padding(vertical = 8.dp))
+            if (txn.direction == Direction.CREDIT) {
+                Spacer(Modifier.height(8.dp))
+                Text("Was this a refund?", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CategoryChip("Income", txn.kind == TxnKind.INCOME) {
+                        ServiceLocator.appScope.launch { ServiceLocator.repository.markCaptureKind(txn.id, TxnKind.INCOME) }
+                    }
+                    CategoryChip("Refund", txn.kind == TxnKind.REFUND) {
+                        ServiceLocator.appScope.launch { ServiceLocator.repository.markCaptureKind(txn.id, TxnKind.REFUND) }
+                    }
+                }
+            }
+        }
     }
 }
 

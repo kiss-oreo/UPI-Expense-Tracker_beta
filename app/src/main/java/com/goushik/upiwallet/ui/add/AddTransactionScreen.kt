@@ -31,6 +31,7 @@ import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -74,6 +75,7 @@ import com.goushik.upiwallet.util.Money
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -111,24 +113,28 @@ private object NotAfterToday : SelectableDates {
  * lets the deterministic [Categorization] sweep tag it from the payee.
  */
 @Composable
-fun AddTransactionScreen(onBack: () -> Unit) {
+fun AddTransactionScreen(onBack: () -> Unit, editingId: String? = null) {
     BackHandler { onBack() }
 
     val accounts by ServiceLocator.repository.observeAnchors().collectAsStateWithLifecycle(emptyList())
     val instruments by ServiceLocator.repository.observeInstruments().collectAsStateWithLifecycle(emptyList())
+    val editing by produceState<TransactionEntity?>(null, editingId) {
+        if (editingId != null) value = ServiceLocator.repository.transactionById(editingId)
+    }
 
     Column(
         Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp),
     ) {
-        TopBar(onBack)
-        Body(accounts, instruments, onBack)
+        TopBar(onBack, editingId != null)
+        if (editingId == null || editing != null) Body(accounts, instruments, onBack, editing)
+        else Text("Loading transaction…", color = TextSecondary)
         Spacer(Modifier.height(28.dp))
     }
 }
 
 @Composable
-private fun TopBar(onBack: () -> Unit) {
+private fun TopBar(onBack: () -> Unit, editing: Boolean) {
     Row(
         Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -140,25 +146,33 @@ private fun TopBar(onBack: () -> Unit) {
             IconChevronLeft(TextPrimary, size = 20.dp)
         }
         Spacer(Modifier.width(14.dp))
-        Text("Add transaction", style = MaterialTheme.typography.titleLarge, color = TextPrimary)
+        Text(if (editing) "Edit transaction" else "Add transaction",
+            style = MaterialTheme.typography.titleLarge, color = TextPrimary)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentInstrumentEntity>, onBack: () -> Unit) {
+private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentInstrumentEntity>,
+                 onBack: () -> Unit, initial: TransactionEntity?) {
     val context = LocalContext.current
-    var kind by remember { mutableStateOf(TxnKind.EXPENSE) }
-    var direction by remember { mutableStateOf(Direction.DEBIT) } // repayment can be paid or received
-    var amount by remember { mutableStateOf("") }
-    var payee by remember { mutableStateOf("") }
-    var note by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
-    var dateMs by remember { mutableStateOf<Long?>(null) }   // a date-picker value (UTC midnight); null = now
-    var accountId by remember { mutableStateOf<String?>(null) }
-    var toAccountId by remember { mutableStateOf<String?>(null) }
-    var instrumentId by remember { mutableStateOf<String?>(null) }
-    var category by remember { mutableStateOf<Category?>(null) }
+    val key = initial?.id
+    var kind by remember(key) { mutableStateOf(initial?.kind ?:
+        if (initial?.direction == Direction.CREDIT) TxnKind.INCOME else TxnKind.EXPENSE) }
+    var direction by remember(key) { mutableStateOf(initial?.direction ?: Direction.DEBIT) }
+    var amount by remember(key) { mutableStateOf(initial?.amountPaise?.let { "${it / 100}.%02d".format(it % 100) }.orEmpty()) }
+    var payee by remember(key) { mutableStateOf(initial?.payeeName.orEmpty()) }
+    var note by remember(key) { mutableStateOf(initial?.note.orEmpty()) }
+    var error by remember(key) { mutableStateOf<String?>(null) }
+    // Picker values are UTC midnight of the local date, NOT the original event instant.
+    var dateMs by remember(key) { mutableStateOf(initial?.let {
+        PickerDate.of(Instant.ofEpochMilli(it.timestampEvent).atZone(zone).toLocalDate())
+    }) }
+    var dateChanged by remember(key) { mutableStateOf(false) }
+    var accountId by remember(key) { mutableStateOf(initial?.accountId) }
+    var toAccountId by remember(key) { mutableStateOf(initial?.toAccountId) }
+    var instrumentId by remember(key) { mutableStateOf(initial?.instrumentId) }
+    var category by remember(key) { mutableStateOf(Category.fromLabel(initial?.category)) }
     var pickingDate by remember { mutableStateOf(false) }
 
     Spacer(Modifier.height(12.dp))
@@ -271,7 +285,7 @@ private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentI
     val valid = paise != null && paise > 0 && (accounts.isEmpty() || accountId != null) &&
         (kind != TxnKind.TRANSFER || (accountId != null && toAccountId != null && accountId != toAccountId))
     PrimaryButton(
-        if (kind == TxnKind.TRANSFER) "Transfer money" else "Add transaction",
+        if (initial != null) "Save changes" else if (kind == TxnKind.TRANSFER) "Transfer money" else "Add transaction",
         enabled = valid,
         onClick = {
             val amt = paise ?: return@PrimaryButton
@@ -281,10 +295,12 @@ private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentI
             val destination = accounts.firstOrNull { it.id == toAccountId }
             val picked = dateMs
             val draft = TransactionEntity(
-                id = Ids.uuid7(), amountPaise = amt, direction = direction, status = TxnStatus.CONFIRMED,
+                id = initial?.id ?: Ids.uuid7(), amountPaise = amt, direction = direction,
+                status = initial?.status ?: TxnStatus.CONFIRMED,
                 payeeName = if (selectedKind == TxnKind.TRANSFER) destination?.accountLabel else payee.trim().ifBlank { null },
-                timestampEvent = PickerDate.eventMsFor(picked, System.currentTimeMillis(), zone),
-                timestampCaptured = System.currentTimeMillis(), source = Source.MANUAL,
+                timestampEvent = if (initial != null && !dateChanged) initial.timestampEvent else
+                    PickerDate.eventMsFor(picked, System.currentTimeMillis(), zone),
+                timestampCaptured = initial?.timestampCaptured ?: System.currentTimeMillis(), source = Source.MANUAL,
                 needsReview = false, bankLabel = selected?.accountLabel, kind = selectedKind,
                 accountId = accountId, toAccountId = if (selectedKind == TxnKind.TRANSFER) toAccountId else null,
                 instrumentId = if (selectedKind == TxnKind.TRANSFER) null else instrumentId,
@@ -293,18 +309,20 @@ private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentI
                 categorySource = if (chosen != null) "manual" else null,
             )
             ServiceLocator.appScope.launch {
-                runCatching {
-                    val repo = ServiceLocator.repository
-                    check(repo.saveManual(draft))
-                    if (chosen != null) {
-                        Categorizer.matchKey(draft)?.let { key ->
-                            repo.upsertMerchantRule(MerchantRuleEntity(key, chosen.label, "user", draft.timestampCaptured))
+                val repo = ServiceLocator.repository
+                runCatching { check(repo.saveManual(draft)) { "Payment was already removed." } }
+                    .onSuccess {
+                        // Auxiliary learning/notifications may fail; the entry is already saved.
+                        runCatching {
+                            if (chosen != null) {
+                                Categorizer.matchKey(draft)?.let { key ->
+                                    repo.upsertMerchantRule(MerchantRuleEntity(key, chosen.label, "user", draft.timestampCaptured))
+                                }
+                            } else Categorization.run(repo)
                         }
-                    } else {
-                        Categorization.run(repo)
+                        runCatching { com.goushik.upiwallet.domain.budget.BudgetAlerts.check(context) }
+                        withContext(Dispatchers.Main) { onBack() }
                     }
-                    com.goushik.upiwallet.domain.budget.BudgetAlerts.check(context)
-                }.onSuccess { withContext(Dispatchers.Main) { onBack() } }
                     .onFailure { withContext(Dispatchers.Main) { error = it.message ?: "Couldn't save transaction" } }
             }
         },
@@ -322,7 +340,7 @@ private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentI
                 val sel = dpState.selectedDateMillis
                 TextButton(
                     enabled = sel != null,
-                    onClick = { if (sel != null) dateMs = sel; pickingDate = false },
+                    onClick = { if (sel != null) { dateMs = sel; dateChanged = true }; pickingDate = false },
                 ) { Text("OK") }
             },
             dismissButton = { TextButton(onClick = { pickingDate = false }) { Text("Cancel") } },
@@ -350,8 +368,8 @@ private fun DirectionToggle(direction: Direction, onChange: (Direction) -> Unit)
         Modifier.fillMaxWidth().clip(PillShape).background(FieldBg).padding(4.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        ToggleHalf("Spent", direction == Direction.DEBIT, Modifier.weight(1f)) { onChange(Direction.DEBIT) }
-        ToggleHalf("Received", direction == Direction.CREDIT, Modifier.weight(1f)) { onChange(Direction.CREDIT) }
+        ToggleHalf("Paid back", direction == Direction.DEBIT, Modifier.weight(1f)) { onChange(Direction.DEBIT) }
+        ToggleHalf("Received back", direction == Direction.CREDIT, Modifier.weight(1f)) { onChange(Direction.CREDIT) }
     }
 }
 

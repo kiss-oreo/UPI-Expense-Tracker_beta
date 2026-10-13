@@ -208,9 +208,11 @@ object ServiceLocator {
                 repository.observeTransactions().map { },
                 repository.observeAnchors().map { },
                 repository.observeBudgets().map { },
+                repository.observeCategoryBudgets().map { },
+                repository.observeInstruments().map { },
                 repository.observeProfile().map { },
             ).debounce(BACKUP_DEBOUNCE_MS).collect {
-                if (repository.profile()?.onboardedAt == null) return@collect
+                if (!Backup.autoBackupEnabled(appContext) || repository.profile()?.onboardedAt == null) return@collect
                 runCatching { Backup.writeToDownloads(appContext, db) }
                     .onFailure { t -> Dbg.w { "auto-backup failed: ${t.javaClass.simpleName}" } }
             }
