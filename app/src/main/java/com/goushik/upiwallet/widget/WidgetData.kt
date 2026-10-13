@@ -2,6 +2,7 @@ package com.goushik.upiwallet.widget
 
 import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.BudgetEntity
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
 import com.goushik.upiwallet.data.TransactionEntity
 import com.goushik.upiwallet.data.TransactionRepository
 import com.goushik.upiwallet.data.UserProfileEntity
@@ -15,9 +16,8 @@ import com.goushik.upiwallet.domain.insights.spendInPeriod
  *  reports what has gone. */
 enum class WidgetSize { SMALL, BIG, LARGE, BUDGET, QUOTA }
 
-/** A per-account "at setup" baseline (live per-account attribution is deferred in BalanceCalculator,
- *  so the chips show the entered baseline — matching Home's "at setup" chips, NOT the live total). */
-data class WidgetAccount(val label: String, val baselinePaise: Long)
+/** Current per-account balance, masked until the owner reveals it. */
+data class WidgetAccount(val label: String, val availablePaise: Long)
 
 /**
  * One-shot snapshot the widgets render. A PURE builder so it's testable and reused by BOTH the
@@ -58,17 +58,19 @@ data class WidgetSnapshot(
             profile: UserProfileEntity?,
             budgets: List<BudgetEntity>,
             nowMs: Long,
+            instruments: List<PaymentInstrumentEntity> = emptyList(),
         ): WidgetSnapshot {
             val ownVpas = profile?.ownVpaSet() ?: emptySet()
             val ownNames = profile?.ownNameSet() ?: emptySet()
             val day = spendInPeriod(txns, ownVpas, ownNames, InsightsPeriod.DAY, nowMs).toList()
             val week = spendInPeriod(txns, ownVpas, ownNames, InsightsPeriod.WEEK, nowMs).toList()
             val month = spendInPeriod(txns, ownVpas, ownNames, InsightsPeriod.MONTH, nowMs).toList()
+            val ledger = BalanceCalculator.ledger(anchors, txns, ownVpas, ownNames, instruments)
             return WidgetSnapshot(
                 // Spend-only users never set a balance (no anchors), so the gate is onboardedAt alone now.
                 onboarded = profile?.onboardedAt != null,
-                availablePaise = BalanceCalculator.available(anchors, txns, ownVpas, ownNames),
-                accounts = anchors.map { WidgetAccount(it.accountLabel, it.baselinePaise) },
+                availablePaise = ledger.totalPaise,
+                accounts = ledger.accounts.map { WidgetAccount(it.account.accountLabel, it.availablePaise) },
                 dayPaise = day.sumOf { it.amountPaise },
                 dayCount = day.size,
                 monthPaise = month.sumOf { it.amountPaise },
@@ -92,5 +94,6 @@ object WidgetData {
     suspend fun load(repo: TransactionRepository): WidgetSnapshot =
         WidgetSnapshot.build(
             repo.transactions(), repo.anchors(), repo.profile(), repo.budgets(), System.currentTimeMillis(),
+            repo.instruments(),
         )
 }

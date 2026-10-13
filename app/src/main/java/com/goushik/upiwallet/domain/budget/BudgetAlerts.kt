@@ -27,7 +27,8 @@ object BudgetAlerts {
         if (!ServiceLocator.uiPrefs.budgetAlerts.value) return
         val repo = ServiceLocator.repository
         val budgets = repo.budgets().filter { it.limitPaise > 0L }
-        if (budgets.isEmpty()) return
+        val categoryBudgets = repo.categoryBudgets().filter { it.limitPaise > 0L }
+        if (budgets.isEmpty() && categoryBudgets.isEmpty()) return
 
         val nm = NotificationManagerCompat.from(context)
         if (!nm.areNotificationsEnabled()) return          // permission off → nothing to post
@@ -42,16 +43,30 @@ object BudgetAlerts {
         for (b in budgets) {
             val status = budgetStatus(b, txns, ownVpas, ownNames, now)
             val reached = status.reachedThreshold()
-            // The marker only counts within its own window — a new period (different start) re-arms to 0.
             val already = if (b.lastAlertedPeriodStart == status.windowStart) b.lastAlertedThreshold else 0
             when {
                 reached > already -> {
-                    notify(context, nm, status)
-                    repo.markBudgetAlerted(b.period, reached, status.windowStart)
+                    if (repo.markBudgetAlerted(b.period, reached, status.windowStart) > 0) {
+                        notify(context, nm, status)
+                    }
                 }
-                // Carry the marker into the new window even when nothing's reached, so the next crossing fires.
                 b.lastAlertedPeriodStart != status.windowStart && b.lastAlertedThreshold != 0 ->
                     repo.markBudgetAlerted(b.period, 0, status.windowStart)
+            }
+        }
+        for (b in categoryBudgets) {
+            val status = categoryBudgetStatus(b, txns, ownVpas, ownNames, now)
+            val meter = status.meter
+            val reached = meter.reachedThreshold()
+            val already = if (b.lastAlertedPeriodStart == status.monthStart) b.lastAlertedThreshold else 0
+            when {
+                reached > already -> {
+                    if (repo.markCategoryBudgetAlerted(b.category, reached, status.monthStart) > 0) {
+                        notifyCategory(context, nm, b.category, meter)
+                    }
+                }
+                b.lastAlertedPeriodStart != status.monthStart && b.lastAlertedThreshold != 0 ->
+                    repo.markCategoryBudgetAlerted(b.category, 0, status.monthStart)
             }
         }
     }
@@ -84,6 +99,17 @@ object BudgetAlerts {
         nm.notify(NOTIF_BASE + status.period.ordinal, notif)
     }
 
+    @Suppress("MissingPermission")
+    private fun notifyCategory(context: Context, nm: NotificationManagerCompat, category: String, meter: BudgetStatus) {
+        val title = if (meter.isOver) "$category budget reached" else "$category budget nearing limit"
+        val text = "${meter.pct}% of this month's $category budget used."
+        val notif = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_widget_refresh)
+            .setContentTitle(title).setContentText(text).setAutoCancel(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT).build()
+        nm.notify(NOTIF_BASE + 100 + category.hashCode(), notif)
+    }
 }
 
 /**

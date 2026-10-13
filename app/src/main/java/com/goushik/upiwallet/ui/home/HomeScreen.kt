@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -131,6 +132,16 @@ fun HomeContent(
                 onUpdateBalance = onUpdateBalance,
                 onOpenBudgets = onOpenBudgets,
             )
+        }
+
+        if (state.unassignedCount > 0 && state.accounts.isNotEmpty()) {
+            item {
+                Text("${state.unassignedCount} payment(s) have no confirmed account " +
+                    "(${com.goushik.upiwallet.util.Money.format(state.unassignedPaise)} adjustment). " +
+                    "Assign them in transaction details so each balance is accurate.",
+                    style = MaterialTheme.typography.bodySmall, color = TextTertiary,
+                    modifier = Modifier.clickable(onClick = onViewAllRecent))
+            }
         }
 
         item {

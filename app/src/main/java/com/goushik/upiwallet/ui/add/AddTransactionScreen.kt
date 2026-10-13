@@ -31,16 +31,20 @@ import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.Direction
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
+import com.goushik.upiwallet.data.TxnKind
 import com.goushik.upiwallet.data.MerchantRuleEntity
 import com.goushik.upiwallet.data.Source
 import com.goushik.upiwallet.data.TransactionEntity
@@ -55,6 +59,7 @@ import com.goushik.upiwallet.ui.common.IconChevronLeft
 import com.goushik.upiwallet.ui.common.PrimaryButton
 import com.goushik.upiwallet.ui.common.WalletTextField
 import com.goushik.upiwallet.ui.theme.FieldBg
+import com.goushik.upiwallet.ui.theme.RedDebit
 import com.goushik.upiwallet.ui.theme.HairlineColor
 import com.goushik.upiwallet.ui.theme.PillShape
 import com.goushik.upiwallet.ui.theme.TextPrimary
@@ -66,7 +71,9 @@ import com.goushik.upiwallet.ui.theme.White
 import com.goushik.upiwallet.ui.theme.glassSurface
 import com.goushik.upiwallet.util.Ids
 import com.goushik.upiwallet.util.Money
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -107,17 +114,15 @@ private object NotAfterToday : SelectableDates {
 fun AddTransactionScreen(onBack: () -> Unit) {
     BackHandler { onBack() }
 
-    // Account chips come from the user's anchors (HDFC / SBI …); load once.
-    val accounts by produceState(initialValue = emptyList<String>()) {
-        value = ServiceLocator.repository.anchors().map { it.accountLabel }
-    }
+    val accounts by ServiceLocator.repository.observeAnchors().collectAsStateWithLifecycle(emptyList())
+    val instruments by ServiceLocator.repository.observeInstruments().collectAsStateWithLifecycle(emptyList())
 
     Column(
         Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp),
     ) {
         TopBar(onBack)
-        Body(accounts, onBack)
+        Body(accounts, instruments, onBack)
         Spacer(Modifier.height(28.dp))
     }
 }
@@ -141,19 +146,47 @@ private fun TopBar(onBack: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun Body(accounts: List<String>, onBack: () -> Unit) {
-    var direction by remember { mutableStateOf(Direction.DEBIT) }
+private fun Body(accounts: List<BalanceAnchorEntity>, instruments: List<PaymentInstrumentEntity>, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var kind by remember { mutableStateOf(TxnKind.EXPENSE) }
+    var direction by remember { mutableStateOf(Direction.DEBIT) } // repayment can be paid or received
     var amount by remember { mutableStateOf("") }
     var payee by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
     var dateMs by remember { mutableStateOf<Long?>(null) }   // a date-picker value (UTC midnight); null = now
-    var account by remember { mutableStateOf<String?>(null) }
+    var accountId by remember { mutableStateOf<String?>(null) }
+    var toAccountId by remember { mutableStateOf<String?>(null) }
+    var instrumentId by remember { mutableStateOf<String?>(null) }
     var category by remember { mutableStateOf<Category?>(null) }
     var pickingDate by remember { mutableStateOf(false) }
 
     Spacer(Modifier.height(12.dp))
-
-    // ── Spent / Received ──
-    DirectionToggle(direction) { direction = it }
+    FieldLabel("Type")
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(
+            TxnKind.EXPENSE to "Spent", TxnKind.INCOME to "Received",
+            TxnKind.TRANSFER to "Transfer", TxnKind.REFUND to "Refund",
+            TxnKind.REPAYMENT to "Debt repayment",
+        ).forEach { (option, title) ->
+            SelectChip(title, kind == option) {
+                kind = option
+                direction = if (option == TxnKind.INCOME || option == TxnKind.REFUND) Direction.CREDIT else Direction.DEBIT
+                instrumentId = null
+            }
+        }
+    }
+    if (kind == TxnKind.REPAYMENT) {
+        Spacer(Modifier.height(12.dp))
+        DirectionToggle(direction) { direction = it }
+        Text("Paying or collecting an existing debt does not add a new expense or income.",
+            style = MaterialTheme.typography.bodySmall, color = TextTertiary)
+    }
+    if (kind == TxnKind.TRANSFER) {
+        Spacer(Modifier.height(10.dp))
+        Text("Moves money between two accounts. Never counted as spending.",
+            style = MaterialTheme.typography.bodySmall, color = TextTertiary)
+    }
 
     Spacer(Modifier.height(22.dp))
     FieldLabel("Amount")
@@ -162,13 +195,15 @@ private fun Body(accounts: List<String>, onBack: () -> Unit) {
         keyboardType = KeyboardType.Decimal, textStyle = MaterialTheme.typography.headlineMedium,
     )
 
-    Spacer(Modifier.height(18.dp))
-    FieldLabel(if (direction == Direction.DEBIT) "Paid to" else "Received from", "optional")
-    WalletTextField(
-        payee, { payee = it },
-        placeholder = if (direction == Direction.DEBIT) "e.g. Swiggy" else "e.g. Rohan",
-        textStyle = MaterialTheme.typography.titleLarge,
-    )
+    if (kind != TxnKind.TRANSFER) {
+        Spacer(Modifier.height(18.dp))
+        FieldLabel(if (direction == Direction.DEBIT) "Paid to" else "Received from", "optional")
+        WalletTextField(
+            payee, { payee = it },
+            placeholder = if (direction == Direction.DEBIT) "e.g. Swiggy" else "e.g. Rohan",
+            textStyle = MaterialTheme.typography.titleLarge,
+        )
+    }
 
     Spacer(Modifier.height(18.dp))
     FieldLabel("When")
@@ -176,68 +211,102 @@ private fun Body(accounts: List<String>, onBack: () -> Unit) {
 
     if (accounts.isNotEmpty()) {
         Spacer(Modifier.height(18.dp))
-        FieldLabel("Account", "optional")
+        FieldLabel(if (kind == TxnKind.TRANSFER) "From account" else "Account")
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            accounts.forEach { label ->
-                SelectChip(label, account == label) { account = if (account == label) null else label }
+            accounts.forEach { a ->
+                SelectChip(a.accountLabel + (a.accountLast4?.let { " ••$it" } ?: ""), accountId == a.id) {
+                    accountId = a.id
+                    instrumentId = null
+                }
+            }
+        }
+        if (kind == TxnKind.TRANSFER) {
+            Spacer(Modifier.height(14.dp))
+            FieldLabel("To account")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                accounts.filter { it.id != accountId }.forEach { a ->
+                    SelectChip(a.accountLabel + (a.accountLast4?.let { " ••$it" } ?: ""), toAccountId == a.id) {
+                        toAccountId = a.id
+                    }
+                }
+            }
+        } else {
+            val linked = instruments.filter { it.accountId == accountId }
+            if (linked.isNotEmpty()) {
+                Spacer(Modifier.height(14.dp))
+                FieldLabel("Paid via", "optional — same account, not another balance")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    linked.forEach { item ->
+                        SelectChip(item.label, instrumentId == item.id) {
+                            instrumentId = if (instrumentId == item.id) null else item.id
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        Text("No accounts set up yet. This entry will be unassigned until you add one.",
+            style = MaterialTheme.typography.bodySmall, color = TextTertiary)
+    }
+
+    if (kind == TxnKind.EXPENSE) {
+        Spacer(Modifier.height(18.dp))
+        FieldLabel("Category", "optional — we'll guess if you skip it")
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ManualCategoryChoices.forEach { cat ->
+                SelectChip(cat.label, category == cat) { category = if (category == cat) null else cat }
             }
         }
     }
-
     Spacer(Modifier.height(18.dp))
-    FieldLabel("Category", "optional — we'll guess if you skip it")
-    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        ManualCategoryChoices.forEach { cat ->
-            SelectChip(cat.label, category == cat) { category = if (category == cat) null else cat }
-        }
+    FieldLabel("Note", "optional; kept only on this phone")
+    WalletTextField(note, { note = it.take(500) }, placeholder = "What was this for?", singleLine = false)
+    error?.let {
+        Spacer(Modifier.height(8.dp))
+        Text(it, style = MaterialTheme.typography.bodySmall, color = RedDebit)
     }
 
     Spacer(Modifier.height(28.dp))
     val paise = Money.parsePaise(amount)
-    val valid = paise != null && paise > 0
+    val valid = paise != null && paise > 0 && (accounts.isEmpty() || accountId != null) &&
+        (kind != TxnKind.TRANSFER || (accountId != null && toAccountId != null && accountId != toAccountId))
     PrimaryButton(
-        "Add transaction",
+        if (kind == TxnKind.TRANSFER) "Transfer money" else "Add transaction",
         enabled = valid,
         onClick = {
-            val amt = Money.parsePaise(amount) ?: return@PrimaryButton
-            val dir = direction
-            val payeeName = payee.trim().ifBlank { null }
-            val bank = account
-            val chosen = category
+            val amt = paise ?: return@PrimaryButton
+            val selectedKind = kind
+            val chosen = category.takeIf { selectedKind == TxnKind.EXPENSE }
+            val selected = accounts.firstOrNull { it.id == accountId }
+            val destination = accounts.firstOrNull { it.id == toAccountId }
             val picked = dateMs
-            // Process-scoped so the write completes even as AppShell swaps this composable out on back.
+            val draft = TransactionEntity(
+                id = Ids.uuid7(), amountPaise = amt, direction = direction, status = TxnStatus.CONFIRMED,
+                payeeName = if (selectedKind == TxnKind.TRANSFER) destination?.accountLabel else payee.trim().ifBlank { null },
+                timestampEvent = PickerDate.eventMsFor(picked, System.currentTimeMillis(), zone),
+                timestampCaptured = System.currentTimeMillis(), source = Source.MANUAL,
+                needsReview = false, bankLabel = selected?.accountLabel, kind = selectedKind,
+                accountId = accountId, toAccountId = if (selectedKind == TxnKind.TRANSFER) toAccountId else null,
+                instrumentId = if (selectedKind == TxnKind.TRANSFER) null else instrumentId,
+                note = note.trim().ifBlank { null }, category = chosen?.label,
+                categoryConfidence = if (chosen != null) 1.0f else null,
+                categorySource = if (chosen != null) "manual" else null,
+            )
             ServiceLocator.appScope.launch {
-                val repo = ServiceLocator.repository
-                val now = System.currentTimeMillis()
-                // The picked calendar day at the current time-of-day (so "today" == now).
-                val tsEvent = PickerDate.eventMsFor(picked, now, zone)
-                val txn = TransactionEntity(
-                    id = Ids.uuid7(),
-                    amountPaise = amt,
-                    direction = dir,
-                    status = TxnStatus.CONFIRMED,
-                    payeeName = payeeName,
-                    timestampEvent = tsEvent,
-                    timestampCaptured = now,
-                    source = Source.MANUAL,
-                    needsReview = false,
-                    bankLabel = bank,
-                    category = chosen?.label,
-                    categoryConfidence = if (chosen != null) 1.0f else null,
-                    categorySource = if (chosen != null) "manual" else null,
-                )
-                repo.insertTransaction(txn)
-                if (chosen != null) {
-                    // Teach the rule, exactly like the detail-screen fix (same matchKey derivation).
-                    Categorizer.matchKey(txn)?.let { key ->
-                        repo.upsertMerchantRule(MerchantRuleEntity(key, chosen.label, "user", now))
+                runCatching {
+                    val repo = ServiceLocator.repository
+                    check(repo.saveManual(draft))
+                    if (chosen != null) {
+                        Categorizer.matchKey(draft)?.let { key ->
+                            repo.upsertMerchantRule(MerchantRuleEntity(key, chosen.label, "user", draft.timestampCaptured))
+                        }
+                    } else {
+                        Categorization.run(repo)
                     }
-                } else {
-                    // No category chosen → let the deterministic pipeline tag this fresh row from its payee.
-                    Categorization.run(repo)
-                }
+                    com.goushik.upiwallet.domain.budget.BudgetAlerts.check(context)
+                }.onSuccess { withContext(Dispatchers.Main) { onBack() } }
+                    .onFailure { withContext(Dispatchers.Main) { error = it.message ?: "Couldn't save transaction" } }
             }
-            onBack()
         },
     )
 

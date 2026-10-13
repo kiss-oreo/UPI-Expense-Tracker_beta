@@ -45,7 +45,6 @@ import com.goushik.upiwallet.ui.common.IconCheck
 import com.goushik.upiwallet.ui.common.IconChevronDown
 import com.goushik.upiwallet.ui.common.TogglePill
 import com.goushik.upiwallet.ui.common.rememberCaptureGrants
-import com.goushik.upiwallet.ui.donate.DonateButton
 import com.goushik.upiwallet.ui.nav.BottomNavHeight
 import com.goushik.upiwallet.ui.theme.GreenCredit
 import com.goushik.upiwallet.ui.theme.HairlineColor
@@ -77,6 +76,7 @@ fun SettingsScreen(
     onEditProfile: () -> Unit,
     onOpenLocation: () -> Unit,
     onOpenBudgets: () -> Unit,
+    onLinkUpi: () -> Unit = {},
     onOpenRemoved: () -> Unit = {},
 ) {
     val repo = ServiceLocator.repository
@@ -86,6 +86,8 @@ fun SettingsScreen(
     val anchors by repo.observeAnchors().collectAsStateWithLifecycle(emptyList())
     val profile by repo.observeProfile().collectAsStateWithLifecycle(null)
     val budgets by repo.observeBudgets().collectAsStateWithLifecycle(emptyList())
+    val categoryBudgets by repo.observeCategoryBudgets().collectAsStateWithLifecycle(emptyList())
+    val instruments by repo.observeInstruments().collectAsStateWithLifecycle(emptyList())
     val (grants, _) = rememberCaptureGrants()
     val ctx = LocalContext.current
 
@@ -108,11 +110,10 @@ fun SettingsScreen(
         }
     }
 
-    val available = BalanceCalculator.available(
-        anchors, txns,
+    val ledger = BalanceCalculator.ledger(anchors, txns,
         ownVpas = profile?.ownVpaSet() ?: emptySet(),
-        ownNames = profile?.ownNameSet() ?: emptySet(),
-    )
+        ownNames = profile?.ownNameSet() ?: emptySet(), instruments = instruments)
+    val available = ledger.totalPaise
     // Post-onboarding there is always a profile + ≥1 anchor; the flows' initial (null / empty) values
     // just mean Room hasn't emitted yet. Guard so entry never flashes a wrong (even negative) balance.
     val ready = profile != null && anchors.isNotEmpty()
@@ -221,8 +222,16 @@ fun SettingsScreen(
                 Box(Modifier.alpha(if (showBalance) 1f else 0.45f)) {
                     SettingsCard {
                         SettingsRow("Available", if (ready) Money.format(available) else "—", first = true)
-                        anchors.forEach { a ->
-                            SettingsRow(a.accountLabel, Money.format(a.baselinePaise))
+                        ledger.accounts.forEach { row ->
+                            val a = row.account
+                            SettingsRow(a.accountLabel + " · " + a.accountType.name.lowercase(),
+                                Money.format(row.availablePaise),
+                                subtitle = a.accountLast4?.let { "Bank ••$it" })
+                        }
+                        if (ledger.unassignedCount > 0) {
+                            SettingsRow("Unassigned · ${ledger.unassignedCount} need review",
+                                Money.format(ledger.unassignedPaise),
+                                subtitle = "In total but not assigned to a bank; tap a payment to fix it")
                         }
                         SettingsRow("↻  Update balance", onClick = onUpdateBalance, chevron = true)
                     }
@@ -242,6 +251,9 @@ fun SettingsScreen(
                         "UPI IDs", subtitle = upiIdsSummary(upiIds) ?: "None added yet",
                         onClick = onEditProfile, chevron = true,
                     )
+                    SettingsRow("Linked payment instruments", "${instruments.size}",
+                        subtitle = "UPI IDs linked to bank accounts (no extra balance)",
+                        onClick = onLinkUpi, chevron = true)
                 }
             }
         }
@@ -317,13 +329,13 @@ fun SettingsScreen(
 
         // ── Budgets (Phase 2) ──
         item {
-            val setCount = budgets.count { it.limitPaise > 0L }
+            val setCount = budgets.count { it.limitPaise > 0L } + categoryBudgets.count { it.limitPaise > 0L }
             SettingsSection("Budgets") {
                 SettingsCard {
                     SettingsRow(
                         "Budgets",
                         value = if (setCount > 0) "$setCount set" else null,
-                        subtitle = "Daily, weekly, monthly limits",
+                        subtitle = "Daily, weekly, monthly and category envelopes",
                         first = true, chevron = true, onClick = onOpenBudgets,
                     )
                 }
@@ -346,27 +358,6 @@ fun SettingsScreen(
                 Text(
                     "Optional, off by default. Reads your location only at pay-time, rounds it to your " +
                         "neighbourhood (~110 m), keeps it on this phone — never uploaded.",
-                    style = MaterialTheme.typography.bodySmall, color = TextTertiary,
-                    modifier = Modifier.padding(start = 2.dp),
-                )
-            }
-        }
-
-        // ── Support (Phase 3 — the pixelated-you donate button; sits directly on the aurora, no glass card) ──
-        item {
-            SettingsSection("Support") {
-                DonateButton()
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    "This app is free and stays on your phone. If it saved you some taps, a small tip " +
-                        "helps keep it going.",
-                    style = MaterialTheme.typography.bodyMedium, color = TextSecondary,
-                    modifier = Modifier.padding(start = 2.dp),
-                )
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    "Optional. Tapping opens a secure donate page in your browser — the app itself " +
-                        "never handles money.",
                     style = MaterialTheme.typography.bodySmall, color = TextTertiary,
                     modifier = Modifier.padding(start = 2.dp),
                 )

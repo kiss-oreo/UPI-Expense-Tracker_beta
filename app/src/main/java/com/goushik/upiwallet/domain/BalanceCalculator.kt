@@ -2,12 +2,17 @@ package com.goushik.upiwallet.domain
 
 import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.Direction
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
 import com.goushik.upiwallet.data.TransactionEntity
+import com.goushik.upiwallet.data.TxnKind
 import com.goushik.upiwallet.data.TxnStatus
 
 object BalanceCalculator {
 
     fun isSelfTransfer(txn: TransactionEntity, ownVpas: Set<String>, ownNames: Set<String>): Boolean {
+        // Explicit manual types win over a name/VPA heuristic; existing captured rows keep the
+        // pre-2.0 behaviour until the owner resolves them in review.
+        if (txn.kind != null) return txn.kind == TxnKind.TRANSFER
         val vpa = txn.payeeVpa?.lowercase()?.trim()
         if (vpa != null && vpa in ownVpas) return true
         val name = txn.payeeName?.lowercase()?.trim() ?: return false
@@ -46,34 +51,76 @@ object BalanceCalculator {
     private val WHITESPACE = Regex("\\s+")
     private fun words(s: String): List<String> = s.split(WHITESPACE).filter { it.isNotEmpty() }
 
-    /**
-     * available = Σ(anchor baselines) − Σ(debits) + Σ(credits), over rows that are not DISCARDED and
-     * not self-transfers. Σ across accounts — per-account attribution is deferred. PENDING/UNCONFIRMED
-     * debits are counted (tentative) to keep the glance number live; known cancels never count.
-     *
-     * Re-anchor semantics: only txns AT/AFTER the most-recent anchor count. At onboarding every anchor
-     * shares one timestamp, so all real spends count (the verified Phase-3 behavior is unchanged). The
-     * "Update balance" flow re-writes the anchors with a fresh timestamp, moving the cutoff to now — so
-     * the entered balance becomes the new truth and only spends from there forward adjust it. Without
-     * this, a second anchor would double-count the baseline and keep subtracting all history.
-     */
+    data class AccountBalance(val account: BalanceAnchorEntity, val availablePaise: Long)
+
+    data class Ledger(
+        val accounts: List<AccountBalance>,
+        /** Money movement that could not safely be assigned to exactly one real account. It remains
+         * visible in the combined total; the account list surfaces it separately until reviewed. */
+        val unassignedPaise: Long,
+        val unassignedCount: Int,
+    ) {
+        val totalPaise: Long get() = accounts.sumOf { it.availablePaise } + unassignedPaise
+    }
+
+    /** Live balances from stable account IDs, in integer paise. A manual transfer changes BOTH account
+     * balances on its one row, but not the combined balance or spending. Re-anchoring an account resets
+     * only its own ledger window. Captures without a unique account match are NOT silently charged to
+     * every bank: they appear as a separate unassigned adjustment. The aggregate keeps the old global
+     * cutoff for these rows, so upgrading 1.x never replays spending from before its last re-anchor.
+     * PENDING/UNCONFIRMED debits are provisional; DISCARDED (failed/removed) ones do not move money. */
+    fun ledger(
+        anchors: List<BalanceAnchorEntity>,
+        txns: List<TransactionEntity>,
+        ownVpas: Set<String>,
+        ownNames: Set<String>,
+        instruments: List<PaymentInstrumentEntity> = emptyList(),
+    ): Ledger {
+        val balances = anchors.associate { it.id to it.baselinePaise }.toMutableMap()
+        val byId = anchors.associateBy { it.id }
+        val oldGlobalCutoff = anchors.maxOfOrNull { it.anchoredAt } ?: Long.MIN_VALUE
+        var unassigned = 0L
+        var unassignedCount = 0
+        fun apply(id: String, delta: Long, at: Long) {
+            val a = byId[id] ?: return
+            if (at >= maxOf(a.anchoredAt, a.openedAt)) balances[id] = balances.getValue(id) + delta
+        }
+        for (t in txns) {
+            if (t.status == TxnStatus.DISCARDED) continue
+            if (t.kind == TxnKind.TRANSFER) {
+                val from = t.accountId
+                val to = t.toAccountId
+                // Never book half a transfer as an expense/credit if an account was removed or corrupt.
+                if (from != null && to != null && from != to && from in byId && to in byId) {
+                    apply(from, -t.amountPaise, t.timestampEvent)
+                    apply(to, t.amountPaise, t.timestampEvent)
+                }
+                continue
+            }
+            // Legacy a11y/SMS self-transfer pairs are excluded until manually reconciled: two
+            // observed legs with the same RRN must never produce two separate balance movements.
+            if (isSelfTransfer(t, ownVpas, ownNames)) continue
+            val delta = if (t.direction == Direction.DEBIT) -t.amountPaise else t.amountPaise
+            // An explicitly assigned account that was later deleted is history of that account,
+            // not a new debit against the remaining accounts' unassigned bucket.
+            if (t.accountId != null && t.accountId !in byId) continue
+            val account = AccountMatch.resolve(t, anchors, instruments)
+            if (account != null) apply(account, delta, t.timestampEvent)
+            else if (t.timestampEvent >= oldGlobalCutoff) {
+                unassigned += delta
+                unassignedCount++
+            }
+        }
+        return Ledger(anchors.map { AccountBalance(it, balances.getValue(it.id)) }, unassigned, unassignedCount)
+    }
+
     fun available(
         anchors: List<BalanceAnchorEntity>,
         txns: List<TransactionEntity>,
         ownVpas: Set<String>,
         ownNames: Set<String>,
-    ): Long {
-        val baseline = anchors.sumOf { it.baselinePaise }
-        val cutoff = anchors.maxOfOrNull { it.anchoredAt } ?: Long.MIN_VALUE
-        val counted = txns.filter {
-            it.status != TxnStatus.DISCARDED &&
-                it.timestampEvent >= cutoff &&
-                !isSelfTransfer(it, ownVpas, ownNames)
-        }
-        val debits = counted.filter { it.direction == Direction.DEBIT }.sumOf { it.amountPaise }
-        val credits = counted.filter { it.direction == Direction.CREDIT }.sumOf { it.amountPaise }
-        return baseline - debits + credits
-    }
+        instruments: List<PaymentInstrumentEntity> = emptyList(),
+    ): Long = ledger(anchors, txns, ownVpas, ownNames, instruments).totalPaise
 
     /**
      * The timestamp to stamp a NEWLY-ADDED account with (the "Add account" flow — distinct from the

@@ -7,6 +7,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.BudgetEntity
 import com.goushik.upiwallet.data.Direction
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
 import com.goushik.upiwallet.data.TransactionEntity
 import com.goushik.upiwallet.data.TransactionRepository
 import com.goushik.upiwallet.data.TxnStatus
@@ -26,8 +27,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 
-/** A per-account starting baseline, shown on the hero chips labeled "at setup". */
-data class AccountBalance(val label: String, val baselinePaise: Long)
+/** The current balance of one real account, not its old opening snapshot. */
+data class AccountBalance(val label: String, val availablePaise: Long)
 
 /** Per-account spend over a window — drives the spend-only hero's "from which account" breakdown. */
 data class AccountSpend(val label: String, val spentPaise: Long)
@@ -66,6 +67,8 @@ data class HomeUiState(
     val loading: Boolean = true,
     val availableBalancePaise: Long = 0L,
     val accounts: List<AccountBalance> = emptyList(),
+    val unassignedCount: Int = 0,
+    val unassignedPaise: Long = 0L,
     val accountMonthSpend: List<AccountSpend> = emptyList(),
     val monthSpentPaise: Long = 0L,
     val monthCount: Int = 0,
@@ -97,6 +100,7 @@ fun buildHomeState(
     profile: UserProfileEntity?,
     budgets: List<BudgetEntity>,
     now: Long,
+    instruments: List<PaymentInstrumentEntity> = emptyList(),
 ): HomeUiState {
     val ownVpas = profile?.ownVpaSet() ?: emptySet()
     val ownNames = profile?.ownNameSet() ?: emptySet()
@@ -105,6 +109,7 @@ fun buildHomeState(
     val today = spendInPeriod(txns, ownVpas, ownNames, InsightsPeriod.DAY, now).toList()
 
     val visible = txns.filter { it.status != TxnStatus.DISCARDED }
+    val ledger = BalanceCalculator.ledger(anchors, txns, ownVpas, ownNames, instruments)
 
     // The monthly cap (if set) — built from the same spendInPeriod, so spent == monthSpentPaise.
     val monthBudget = budgets
@@ -113,15 +118,14 @@ fun buildHomeState(
 
     return HomeUiState(
         loading = false,
-        availableBalancePaise = BalanceCalculator.available(anchors, txns, ownVpas, ownNames),
-        accounts = anchors.map { AccountBalance(it.accountLabel, it.baselinePaise) },
-        // Per-account spend this month, attributed by bank label (canonicalised) → only the user's own
-        // set-up accounts. Spends without a matching account simply aren't shown per-account.
+        availableBalancePaise = ledger.totalPaise,
+        accounts = ledger.accounts.map { AccountBalance(it.account.accountLabel, it.availablePaise) },
+        unassignedCount = ledger.unassignedCount,
+        unassignedPaise = ledger.unassignedPaise,
+        // The same account-ID or unique bank+last4 resolution used for the live ledger.
         accountMonthSpend = anchors.map { a ->
-            AccountSpend(
-                a.accountLabel,
-                month.filter { AccountMatch.matches(it.bankLabel, a.accountLabel) }.sumOf { it.amountPaise },
-            )
+            AccountSpend(a.accountLabel,
+                month.filter { AccountMatch.resolve(it, anchors, instruments) == a.id }.sumOf { it.amountPaise })
         },
         monthSpentPaise = month.sumOf { it.amountPaise },
         monthCount = month.size,
@@ -150,8 +154,9 @@ class HomeViewModel(repo: TransactionRepository) : ViewModel() {
         repo.observeAnchors(),
         repo.observeProfile(),
         repo.observeBudgets(),
-    ) { txns, anchors, profile, budgets ->
-        buildHomeState(txns, anchors, profile, budgets, System.currentTimeMillis())
+        repo.observeInstruments(),
+    ) { txns, anchors, profile, budgets, instruments ->
+        buildHomeState(txns, anchors, profile, budgets, System.currentTimeMillis(), instruments)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), HomeUiState.Empty)
 
     companion object {

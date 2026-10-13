@@ -25,10 +25,12 @@ android {
 
     defaultConfig {
         applicationId = "com.goushik.upiwallet"
-        minSdk = 31
+        // Android 10 (API 29) is the earliest supported release. MediaStore.Downloads and java.time
+        // are available there; notifications and scoped-storage paths are guarded at their own API levels.
+        minSdk = 29
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.1.7"
+        versionCode = 10
+        versionName = "2.0.0-beta.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

@@ -49,17 +49,19 @@ import com.goushik.upiwallet.util.Ids
 import com.goushik.upiwallet.util.Money
 import kotlinx.coroutines.launch
 
-private fun moneyFilter(s: String): String = s.filter { it.isDigit() || it == '.' || it == ',' }
+private fun moneyFilter(s: String): String = s.filter { it.isDigit() || it == '.' || it == ',' || it == '-' }
 
 /** Pre-fill string for a money field: rupees with thousands separators, + ".dd" only if non-zero paise.
  *  No ₹ symbol — the field's prefix carries it (mirrors what moneyFilter accepts). */
 private fun prefillOf(paise: Long): String {
-    val rupees = "%,d".format(paise / 100)
-    val frac = paise % 100
-    return if (frac == 0L) rupees else rupees + ".%02d".format(frac)
+    val sign = if (paise < 0) "-" else ""
+    val positive = kotlin.math.abs(paise)
+    val rupees = "%,d".format(positive / 100)
+    val frac = positive % 100
+    return sign + if (frac == 0L) rupees else rupees + ".%02d".format(frac)
 }
 
-private class FieldState(val anchorId: String, val label: String, val baselinePaise: Long, initial: String) {
+private class FieldState(val anchorId: String, val label: String, val availablePaise: Long, initial: String) {
     var text by mutableStateOf(initial)
 }
 
@@ -74,8 +76,15 @@ fun UpdateBalanceScreen(onBack: () -> Unit, onAddAccount: () -> Unit) {
     BackHandler { onBack() }
 
     // Live (not one-shot) so a per-account delete re-seeds the form; null = first emission pending.
-    val anchors by ServiceLocator.repository.observeAnchors()
-        .collectAsStateWithLifecycle(initialValue = null)
+    val repo = ServiceLocator.repository
+    val anchors by repo.observeAnchors().collectAsStateWithLifecycle(initialValue = null)
+    val txns by repo.observeTransactions().collectAsStateWithLifecycle(emptyList())
+    val profile by repo.observeProfile().collectAsStateWithLifecycle(null)
+    val instruments by repo.observeInstruments().collectAsStateWithLifecycle(emptyList())
+    val ledger = anchors?.let {
+        BalanceCalculator.ledger(it, txns, profile?.ownVpaSet() ?: emptySet(),
+            profile?.ownNameSet() ?: emptySet(), instruments)
+    }
 
     Column(
         Modifier.fillMaxSize().systemBarsPadding().verticalScroll(rememberScrollState())
@@ -84,7 +93,7 @@ fun UpdateBalanceScreen(onBack: () -> Unit, onAddAccount: () -> Unit) {
         TopBar(onBack)
         when (val s = anchors) {
             null -> CenterNote("Loading…")
-            else -> Body(s, onBack, onAddAccount)
+            else -> Body(s, ledger?.accounts?.associate { it.account.id to it.availablePaise }.orEmpty(), onBack, onAddAccount)
         }
         Spacer(Modifier.height(28.dp))
     }
@@ -108,13 +117,16 @@ private fun TopBar(onBack: () -> Unit) {
 }
 
 @Composable
-private fun Body(anchors: List<BalanceAnchorEntity>, onBack: () -> Unit, onAddAccount: () -> Unit) {
+private fun Body(anchors: List<BalanceAnchorEntity>, live: Map<String, Long>, onBack: () -> Unit, onAddAccount: () -> Unit) {
     // Field state seeded from the loaded anchors (label + pre-filled rupee text); user edits live here.
     // Keyed on `anchors` so it re-seeds when they change (e.g. after a delete — unsaved edits in other
     // fields reset then, accepted); synchronous so the form never renders blank.
-    val fields = remember(anchors) {
+    val fields = remember(anchors, live) {
         mutableStateListOf<FieldState>().apply {
-            anchors.forEach { add(FieldState(it.id, it.accountLabel, it.baselinePaise, prefillOf(it.baselinePaise))) }
+            anchors.forEach { a ->
+                val amount = live[a.id] ?: a.baselinePaise
+                add(FieldState(a.id, a.accountLabel, amount, prefillOf(amount)))
+            }
         }
     }
     // The account whose ✕ was tapped — its inline "Remove?" strip is showing. Cleared on any change.
@@ -161,7 +173,7 @@ private fun Body(anchors: List<BalanceAnchorEntity>, onBack: () -> Unit, onAddAc
             Spacer(Modifier.height(10.dp))
             DeleteConfirmStrip(
                 label = f.label,
-                baselinePaise = f.baselinePaise,
+                baselinePaise = f.availablePaise,
                 onKeep = { confirmingDelete = null },
                 onRemove = {
                     confirmingDelete = null
@@ -179,22 +191,15 @@ private fun Body(anchors: List<BalanceAnchorEntity>, onBack: () -> Unit, onAddAc
     GhostButton("+ Add account", onAddAccount)
     Spacer(Modifier.height(12.dp))
     val parsed = fields.map { Money.parsePaise(it.text) }
-    val valid = fields.isNotEmpty() && parsed.all { it != null && it >= 0 }
+    val valid = fields.isNotEmpty() && parsed.all { it != null }
     PrimaryButton(
         "Update",
         onClick = {
-            // Process-scoped so the write completes even as AppShell swaps this composable out on back.
+            // Keep IDs, types and last-four; otherwise every previously assigned transaction and
+            // linked UPI ID would become orphaned when the user simply refreshes their balance.
+            val values = fields.associate { it.anchorId to Money.parsePaise(it.text)!! }
             ServiceLocator.appScope.launch {
-                val repo = ServiceLocator.repository
-                val now = System.currentTimeMillis()
-                // One atomic transaction so observers (Home / Settings) never see an empty or partial
-                // anchor set mid-update — otherwise Available would briefly flicker toward ₹0.
-                repo.inTransaction {
-                    repo.clearAnchors()
-                    fields.forEach { f ->
-                        repo.upsertAnchor(BalanceAnchorEntity(Ids.uuid7(), f.label, Money.parsePaise(f.text)!!, now))
-                    }
-                }
+                ServiceLocator.repository.reanchor(values, System.currentTimeMillis())
             }
             onBack()
         },
@@ -243,16 +248,7 @@ private fun DeleteConfirmStrip(
  * write survives the composable being swapped out.
  */
 private fun deleteAccount(anchorId: String) {
-    ServiceLocator.appScope.launch {
-        val repo = ServiceLocator.repository
-        repo.inTransaction {
-            val before = repo.anchors()
-            val after = BalanceCalculator.anchorsAfterDelete(before, anchorId) ?: return@inTransaction
-            repo.deleteAnchor(anchorId)
-            val stampBefore = before.associate { it.id to it.anchoredAt }
-            after.filter { stampBefore[it.id] != it.anchoredAt }.forEach { repo.upsertAnchor(it) }
-        }
-    }
+    ServiceLocator.appScope.launch { ServiceLocator.repository.removeAccount(anchorId) }
 }
 
 @Composable

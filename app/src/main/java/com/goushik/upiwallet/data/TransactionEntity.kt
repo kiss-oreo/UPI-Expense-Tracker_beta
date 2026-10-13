@@ -17,6 +17,7 @@ import androidx.room.PrimaryKey
         Index(value = ["rrn", "direction"], unique = true),
         Index(value = ["timestampEvent"]),
         Index(value = ["direction", "timestampEvent"]),
+        Index(value = ["accountId"]),
     ],
 )
 data class TransactionEntity(
@@ -42,4 +43,11 @@ data class TransactionEntity(
     // SMS/manual rows, opt-out, or no fresh+accurate fix. Going-forward-only; never uploaded.
     val latRounded: Double? = null,
     val lngRounded: Double? = null,
+    // Null = legacy/auto-captured row; its direction and own-identity evidence decide whether it is
+    // income, spending or a self-transfer. Manual transfers hold both ends on ONE canonical row.
+    val kind: TxnKind? = null,
+    val accountId: String? = null,
+    val toAccountId: String? = null,
+    val instrumentId: String? = null,
+    val note: String? = null,
 )

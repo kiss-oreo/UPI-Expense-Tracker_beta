@@ -40,6 +40,10 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.goushik.upiwallet.data.BudgetEntity
+import com.goushik.upiwallet.data.CategoryBudgetEntity
+import com.goushik.upiwallet.domain.budget.CategoryBudgetStatus
+import com.goushik.upiwallet.domain.budget.categoryBudgetStatus
+import com.goushik.upiwallet.domain.categorize.Category
 import com.goushik.upiwallet.di.ServiceLocator
 import com.goushik.upiwallet.domain.budget.BUDGET_PERIODS
 import com.goushik.upiwallet.domain.budget.BudgetStatus
@@ -74,6 +78,7 @@ fun BudgetsScreen(onBack: () -> Unit) {
     BackHandler { onBack() }
     val repo = ServiceLocator.repository
     val budgets by repo.observeBudgets().collectAsStateWithLifecycle(emptyList())
+    val categoryBudgets by repo.observeCategoryBudgets().collectAsStateWithLifecycle(emptyList())
     val txns by repo.observeTransactions().collectAsStateWithLifecycle(emptyList())
     val profile by repo.observeProfile().collectAsStateWithLifecycle(null)
     val alertsOn by ServiceLocator.uiPrefs.budgetAlerts.collectAsStateWithLifecycle()
@@ -109,6 +114,28 @@ fun BudgetsScreen(onBack: () -> Unit) {
                 onClear = { ServiceLocator.appScope.launch { repo.deleteBudget(period.name) } },
             )
             Spacer(Modifier.height(13.dp))
+        }
+
+        Spacer(Modifier.height(17.dp))
+        Text("By category", style = MaterialTheme.typography.titleLarge, color = TextPrimary)
+        Spacer(Modifier.height(5.dp))
+        Text("Monthly limits. Optional rollover carries unused money forward; envelopes earmark " +
+            "an allowance, not a bank withdrawal.",
+            style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+        Spacer(Modifier.height(14.dp))
+        val byCategory = categoryBudgets.associateBy { it.category }
+        Category.entries.filter { it != Category.SELF_TRANSFER }.forEach { category ->
+            val b = byCategory[category.label]
+            CategoryBudgetCard(category.label, b?.let { categoryBudgetStatus(it, txns, ownVpas, ownNames, now) }, b,
+                onSave = { amount, rollover, envelope ->
+                    ServiceLocator.appScope.launch {
+                        repo.upsertCategoryBudget(CategoryBudgetEntity(category.label, amount, rollover,
+                            envelope, System.currentTimeMillis()))
+                    }
+                },
+                onClear = { ServiceLocator.appScope.launch { repo.deleteCategoryBudget(category.label) } },
+            )
+            Spacer(Modifier.height(10.dp))
         }
 
         Spacer(Modifier.height(5.dp))
@@ -215,6 +242,72 @@ private fun BudgetCard(
                     Spacer(Modifier.weight(1f))
                     ActionPill("Remove") { onClear(); editing = false }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryBudgetCard(
+    category: String,
+    status: CategoryBudgetStatus?,
+    budget: CategoryBudgetEntity?,
+    onSave: (Long, Boolean, Boolean) -> Unit,
+    onClear: () -> Unit,
+) {
+    var editing by remember(category, budget?.updatedAt) { mutableStateOf(false) }
+    var draft by remember(category, budget?.updatedAt) { mutableStateOf(budget?.let { rupeesOf(it.limitPaise) }.orEmpty()) }
+    var rollover by remember(category, budget?.updatedAt) { mutableStateOf(budget?.rollover ?: false) }
+    var envelope by remember(category, budget?.updatedAt) { mutableStateOf(budget?.envelope ?: false) }
+    Column(Modifier.fillMaxWidth().glassSurface(WalletShapes.large).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(category, style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+            Spacer(Modifier.weight(1f))
+            if (!editing) {
+                Text(if (budget == null) "Set a limit" else Money.format(budget.limitPaise),
+                    style = MaterialTheme.typography.labelLarge, color = TextSecondary,
+                    modifier = Modifier.clickable { editing = true }.padding(6.dp))
+            }
+        }
+        if (status != null) {
+            val meter = status.meter
+            Box(Modifier.fillMaxWidth().height(9.dp).clip(PillShape).background(White.copy(alpha = 0.10f))) {
+                Box(Modifier.fillMaxWidth((meter.pct / 100f).coerceIn(0f, 1f)).height(9.dp)
+                    .clip(PillShape).background(when {
+                        meter.isOver -> SolidColor(Coral500)
+                        meter.isNear -> SolidColor(Amber500)
+                        else -> AuroraBrush
+                    }))
+            }
+            Text("${meter.pct}% · ${Money.format(status.spentPaise)} spent" +
+                if (status.carriedPaise > 0L) " · ${Money.format(status.carriedPaise)} rolled over" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (meter.isOver) Coral500 else if (meter.isNear) Amber500 else TextSecondary)
+            Text("${Money.format(meter.remainingPaise)} remaining" +
+                if (status.envelope) " · Envelope" else "",
+                style = MaterialTheme.typography.bodySmall, color = TextTertiary)
+        }
+        if (editing) {
+            WalletTextField(draft, { draft = it.filter { c -> c.isDigit() || c == '.' || c == ',' } },
+                prefix = "₹", placeholder = "Monthly limit", keyboardType = KeyboardType.Decimal)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Roll over unused", Modifier.weight(1f), color = TextSecondary,
+                    style = MaterialTheme.typography.bodyMedium)
+                TogglePill(on = rollover) { rollover = it }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Envelope allocation", Modifier.weight(1f), color = TextSecondary,
+                    style = MaterialTheme.typography.bodyMedium)
+                TogglePill(on = envelope) { envelope = it }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val parsed = Money.parsePaise(draft)
+                ActionPill("Save", accent = true, enabled = parsed != null && parsed > 0L) {
+                    if (parsed != null && parsed > 0L) { onSave(parsed, rollover, envelope); editing = false }
+                }
+                ActionPill("Cancel") { editing = false }
+                if (budget != null) ActionPill("Remove") { onClear(); editing = false }
             }
         }
     }

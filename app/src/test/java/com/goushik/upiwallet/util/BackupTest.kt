@@ -2,6 +2,9 @@ package com.goushik.upiwallet.util
 
 import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.BudgetEntity
+import com.goushik.upiwallet.data.CategoryBudgetEntity
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
+import com.goushik.upiwallet.data.TxnKind
 import com.goushik.upiwallet.data.Direction
 import com.goushik.upiwallet.data.MerchantRuleEntity
 import com.goushik.upiwallet.data.RawEventEntity
@@ -10,6 +13,7 @@ import com.goushik.upiwallet.data.TransactionEntity
 import com.goushik.upiwallet.data.TxnStatus
 import com.goushik.upiwallet.data.UserProfileEntity
 import com.goushik.upiwallet.domain.BalanceCalculator
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
@@ -35,6 +39,7 @@ class BackupTest {
                 bankLabel = "HDFC", rrn = "412345678901", timestampEvent = 1_000, timestampCaptured = 1_050,
                 source = Source.A11Y_SMS, episodeId = "ep-1", needsReview = false, category = "Food",
                 categoryConfidence = 0.5f, categorySource = "auto", latRounded = 12.97, lngRounded = 77.59,
+                accountId = "a1", instrumentId = "i1", kind = TxnKind.EXPENSE, note = "Team lunch",
             ),
             // a11y-only row: no rrn, no vpa, nulls where the schema allows them
             TransactionEntity(
@@ -69,6 +74,8 @@ class BackupTest {
         budgets = listOf(
             BudgetEntity("MONTH", 2_000_000, 500, lastAlertedThreshold = 80, lastAlertedPeriodStart = 100),
         ),
+        categoryBudgets = listOf(CategoryBudgetEntity("Food", 50_000, true, true, 500)),
+        instruments = listOf(PaymentInstrumentEntity("i1", "My UPI", "me@okhdfc", "a1")),
     )
 
     private fun roundTrip(snap: Backup.Snapshot): Backup.Snapshot {
@@ -87,6 +94,8 @@ class BackupTest {
         assertEquals(original.profile, restored.profile)
         assertEquals(original.merchantRules, restored.merchantRules)
         assertEquals(original.budgets, restored.budgets)
+        assertEquals(original.categoryBudgets, restored.categoryBudgets)
+        assertEquals(original.instruments, restored.instruments)
     }
 
     @Test fun `the wallet total reconciles across a round-trip`() {
@@ -120,6 +129,33 @@ class BackupTest {
         val json = Backup.encode(sampleSnapshot(), appVersion = "1.1", dbVersion = 7, exportedAt = 0)
         assertEquals(7, Backup.dbVersionOf(json))
         assertNotNull(json)
+    }
+
+    @Test fun `format one backups still restore without new fields`() {
+        val legacy = JSONObject(Backup.encode(sampleSnapshot(), "1.1.7", 7, 1234)).apply {
+            put("format", 1)
+            remove("categoryBudgets")
+            remove("instruments")
+            getJSONArray("transactions").getJSONObject(0).apply {
+                remove("kind"); remove("accountId"); remove("toAccountId"); remove("instrumentId"); remove("note")
+            }
+            getJSONArray("anchors").getJSONObject(0).apply {
+                remove("accountType"); remove("accountLast4"); remove("openedAt")
+            }
+        }.toString()
+        val restored = Backup.decode(legacy)
+        assertEquals(null, restored.transactions.first().kind)
+        assertEquals(null, restored.transactions.first().accountId)
+        assertEquals(emptyList<CategoryBudgetEntity>(), restored.categoryBudgets)
+        assertEquals(emptyList<PaymentInstrumentEntity>(), restored.instruments)
+    }
+
+    @Test fun `account ID mapping on merge keeps restored transfers pointing to the real phone account`() {
+        val phone = listOf(BalanceAnchorEntity("new-id", "HDFC", 70_000, 5_000))
+        val backup = listOf(BalanceAnchorEntity("old-id", " hdfc ", 50_000, 1_000))
+        val planned = Backup.planAnchorMerge(phone, backup)
+        assertEquals(emptyList<BalanceAnchorEntity>(), planned)
+        assertEquals(mapOf("old-id" to "new-id"), Backup.accountIdMap(phone, planned, backup))
     }
 
     // ── planAnchorMerge: an account is its LABEL, and restore can never move the cutoff ──

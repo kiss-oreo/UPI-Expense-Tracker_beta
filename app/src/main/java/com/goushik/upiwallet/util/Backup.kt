@@ -12,9 +12,14 @@ import androidx.room.withTransaction
 import com.goushik.upiwallet.data.AppDatabase
 import com.goushik.upiwallet.data.BalanceAnchorEntity
 import com.goushik.upiwallet.data.BudgetEntity
+import com.goushik.upiwallet.data.CategoryBudgetEntity
+import com.goushik.upiwallet.data.PaymentInstrumentEntity
+import com.goushik.upiwallet.data.AccountType
+import com.goushik.upiwallet.data.TxnKind
 import com.goushik.upiwallet.data.Direction
 import com.goushik.upiwallet.data.MerchantRuleEntity
 import com.goushik.upiwallet.data.RawEventEntity
+import com.goushik.upiwallet.data.Source
 import com.goushik.upiwallet.data.TransactionEntity
 import com.goushik.upiwallet.data.TxnStatus
 import com.goushik.upiwallet.data.UserProfileEntity
@@ -69,7 +74,7 @@ object Backup {
     const val FILE_NAME = "UET-backup.json"
 
     /** On-disk JSON shape version — bump only on an incompatible layout change. */
-    private const val FORMAT = 1
+    private const val FORMAT = 2 // decoder still accepts the original 1.x JSON layout
 
     /** An in-memory snapshot of every table. */
     data class Snapshot(
@@ -79,6 +84,8 @@ object Backup {
         val profile: UserProfileEntity?,
         val merchantRules: List<MerchantRuleEntity>,
         val budgets: List<BudgetEntity>,
+        val categoryBudgets: List<CategoryBudgetEntity> = emptyList(),
+        val instruments: List<PaymentInstrumentEntity> = emptyList(),
     )
 
     /**
@@ -102,6 +109,8 @@ object Backup {
         val keptUpiIds: Boolean = false,
         val exportedAt: Long? = null,
         val newestPaymentAt: Long? = null,
+        val categoryBudgetsApplied: Int = 0,
+        val instrumentsAdded: Int = 0,
     )
 
     /** The transactions worth inserting from a backup, after content-dedupe against what's on the phone. */
@@ -200,6 +209,8 @@ object Backup {
         profile = db.userProfileDao().get(),
         merchantRules = db.merchantRuleDao().all(),
         budgets = db.budgetDao().all(),
+        categoryBudgets = db.categoryBudgetDao().all(),
+        instruments = db.paymentInstrumentDao().all(),
     )
 
     // ─────────────────────────────── encode (pure) ───────────────────────────────
@@ -217,6 +228,8 @@ object Backup {
         snap.profile?.let { root.put("profile", profileToJson(it)) }
         root.put("merchantRules", JSONArray().apply { snap.merchantRules.forEach { put(ruleToJson(it)) } })
         root.put("budgets", JSONArray().apply { snap.budgets.forEach { put(budgetToJson(it)) } })
+        root.put("categoryBudgets", JSONArray().apply { snap.categoryBudgets.forEach { put(categoryBudgetToJson(it)) } })
+        root.put("instruments", JSONArray().apply { snap.instruments.forEach { put(instrumentToJson(it)) } })
         return root.toString(2)
     }
 
@@ -226,8 +239,8 @@ object Backup {
     fun decode(text: String): Snapshot = decodeRoot(JSONObject(text))
 
     private fun decodeRoot(root: JSONObject): Snapshot {
-        require(root.optInt("format", -1) == FORMAT) {
-            "This file isn't a UPI Expense Tracker backup."
+        require(root.optInt("format", -1) in 1..FORMAT) {
+            "This file isn't a supported UPI Expense Tracker backup."
         }
         return Snapshot(
             transactions = root.optJSONArray("transactions").mapObjects { txnFromJson(it) },
@@ -236,6 +249,8 @@ object Backup {
             profile = root.optJSONObject("profile")?.let { profileFromJson(it) },
             merchantRules = root.optJSONArray("merchantRules").mapObjects { ruleFromJson(it) },
             budgets = root.optJSONArray("budgets").mapObjects { budgetFromJson(it) },
+            categoryBudgets = root.optJSONArray("categoryBudgets").mapObjects { categoryBudgetFromJson(it) },
+            instruments = root.optJSONArray("instruments").mapObjects { instrumentFromJson(it) },
         )
     }
 
@@ -317,13 +332,17 @@ object Backup {
     }
 
     private fun contentKey(t: TransactionEntity) =
-        listOf(t.direction, t.amountPaise, t.timestampEvent, DuplicateDetection.payeeKey(t))
+        listOf(t.kind, t.direction, t.amountPaise, t.timestampEvent, DuplicateDetection.payeeKey(t),
+            t.accountId, t.toAccountId)
 
     private fun isWindowedTwin(t: TransactionEntity, candidates: List<TransactionEntity>?): Boolean {
-        if (candidates == null) return false
+        // A user's two similarly priced transfers or manual cash entries are not a duplicate capture.
+        if (candidates == null || t.source == Source.MANUAL || t.kind == TxnKind.TRANSFER) return false
         val key = DuplicateDetection.payeeKey(t) ?: return false
         return candidates.any {
-            DuplicateDetection.payeeKey(it) == key &&
+            it.source != Source.MANUAL && it.kind == t.kind &&
+                (t.accountId == null || it.accountId == null || t.accountId == it.accountId) &&
+                DuplicateDetection.payeeKey(it) == key &&
                 abs(it.timestampEvent - t.timestampEvent) <= CONTENT_WINDOW_MS
         }
     }
@@ -404,13 +423,11 @@ object Backup {
         existing: List<BalanceAnchorEntity>,
         incoming: List<BalanceAnchorEntity>,
     ): List<BalanceAnchorEntity> {
-        val labels = existing.mapTo(HashSet()) { normLabel(it.accountLabel) }
-        val ids = existing.mapTo(HashSet()) { it.id }
+        val seen = existing.toMutableList()
         val survivors = mutableListOf<BalanceAnchorEntity>()
         for (a in incoming) {
-            val label = normLabel(a.accountLabel)
-            if (label in labels || a.id in ids) continue
-            labels += label
+            if (seen.any { it.id == a.id || sameAccount(it, a) }) continue
+            seen += a
             survivors += a
         }
         val cutoff = existing.maxOfOrNull { it.anchoredAt } ?: return survivors
@@ -418,6 +435,23 @@ object Backup {
     }
 
     private fun normLabel(s: String) = s.trim().lowercase()
+    private fun sameAccount(a: BalanceAnchorEntity, b: BalanceAnchorEntity): Boolean =
+        a.accountType == b.accountType && normLabel(a.accountLabel) == normLabel(b.accountLabel) &&
+            (a.accountLast4 == b.accountLast4 || a.accountLast4 == null || b.accountLast4 == null)
+
+    /** A skipped account still needs its backup ID rewritten to the matching phone account ID;
+     * otherwise a restored transaction would point at a missing ID and change the account totals. */
+    fun accountIdMap(
+        onPhone: List<BalanceAnchorEntity>,
+        planned: List<BalanceAnchorEntity>,
+        incoming: List<BalanceAnchorEntity>,
+    ): Map<String, String> {
+        val available = onPhone + planned
+        return incoming.mapNotNull { a ->
+            available.firstOrNull { it.id == a.id }?.let { a.id to it.id }
+                ?: available.firstOrNull { sameAccount(it, a) }?.let { a.id to it.id }
+        }.toMap()
+    }
 
     // ─────────────────────────────── what the toasts say (pure) ───────────────────────────────
 
@@ -478,17 +512,46 @@ object Backup {
             val ruleDao = db.merchantRuleDao()
             val budgetDao = db.budgetDao()
 
+            val phoneAnchors = anchorDao.all()
+            val anchorPlan = planAnchorMerge(phoneAnchors, snap.anchors)
+            val accountMap = accountIdMap(phoneAnchors, anchorPlan, snap.anchors)
+            for (a in anchorPlan) anchorDao.upsert(a)
+
+            val instrumentDao = db.paymentInstrumentDao()
+            val oldInstruments = instrumentDao.all()
+            val instrumentIds = HashMap<String, String>()
+            var instrumentsAdded = 0
+            for (item in snap.instruments) {
+                val mappedAccount = accountMap[item.accountId] ?: continue
+                val duplicate = oldInstruments.firstOrNull { it.id == item.id ||
+                    it.vpa.equals(item.vpa, ignoreCase = true) }
+                if (duplicate != null) instrumentIds[item.id] = duplicate.id
+                else {
+                    val saved = item.copy(accountId = mappedAccount)
+                    instrumentDao.upsert(saved)
+                    instrumentIds[item.id] = saved.id
+                    instrumentsAdded++
+                }
+            }
+
+            // Repoint foreign IDs BEFORE inserting and content-deduping. Orphaned references become
+            // unassigned for explicit review; never invent a balance on another account.
+            val mappedTxns = snap.transactions.map { t ->
+                t.copy(accountId = t.accountId?.let { accountMap[it] ?: it },
+                    toAccountId = t.toAccountId?.let { accountMap[it] ?: it },
+                    instrumentId = t.instrumentId?.let(instrumentIds::get),
+                    needsReview = t.needsReview || (t.accountId != null && t.accountId !in accountMap))
+            }
             val phoneTxns = txnDao.allOnce()
-            val txnPlan = planTxnMerge(phoneTxns, snap.transactions)
+            val txnPlan = planTxnMerge(phoneTxns, mappedTxns)
             val inserted = HashSet<String>()
             for (t in txnPlan.toInsert) if (txnDao.insert(t) != -1L) inserted += t.id
             var addedRaw = 0
             val rawPlan = planRawMerge(phoneTxns.mapTo(HashSet()) { it.id }, inserted, snap.rawEvents)
             for (r in rawPlan) if (rawDao.insertIgnore(r) != -1L) addedRaw++
-            val anchorPlan = planAnchorMerge(anchorDao.all(), snap.anchors)
-            for (a in anchorPlan) anchorDao.upsert(a)
             for (m in snap.merchantRules) ruleDao.upsert(m)
             for (b in snap.budgets) budgetDao.upsert(b)
+            for (b in snap.categoryBudgets) db.categoryBudgetDao().upsert(b)
             val profilePlan = planProfileMerge(
                 profileDao.get(), snap.profile, holdOnboarding,
                 showBalanceIfNew = snap.anchors.isNotEmpty(),
@@ -504,6 +567,8 @@ object Backup {
                 profileApplied = profilePlan.profile != null,
                 merchantRulesApplied = snap.merchantRules.size,
                 budgetsApplied = snap.budgets.size,
+                categoryBudgetsApplied = snap.categoryBudgets.size,
+                instrumentsAdded = instrumentsAdded,
                 keptName = profilePlan.keptName,
                 keptUpiIds = profilePlan.keptUpiIds,
             )
@@ -840,6 +905,11 @@ object Backup {
         putNullable("categorySource", t.categorySource)
         putNullable("latRounded", t.latRounded)
         putNullable("lngRounded", t.lngRounded)
+        putNullable("kind", t.kind?.name)
+        putNullable("accountId", t.accountId)
+        putNullable("toAccountId", t.toAccountId)
+        putNullable("instrumentId", t.instrumentId)
+        putNullable("note", t.note)
     }
 
     private fun txnFromJson(o: JSONObject) = TransactionEntity(
@@ -862,6 +932,11 @@ object Backup {
         categorySource = o.stringOrNull("categorySource"),
         latRounded = o.doubleOrNull("latRounded"),
         lngRounded = o.doubleOrNull("lngRounded"),
+        kind = o.stringOrNull("kind")?.let(TxnKind::valueOf),
+        accountId = o.stringOrNull("accountId"),
+        toAccountId = o.stringOrNull("toAccountId"),
+        instrumentId = o.stringOrNull("instrumentId"),
+        note = o.stringOrNull("note"),
     )
 
     private fun rawToJson(r: RawEventEntity) = JSONObject().apply {
@@ -889,6 +964,9 @@ object Backup {
         put("accountLabel", a.accountLabel)
         put("baselinePaise", a.baselinePaise)
         put("anchoredAt", a.anchoredAt)
+        put("accountType", a.accountType.name)
+        putNullable("accountLast4", a.accountLast4)
+        put("openedAt", a.openedAt)
     }
 
     private fun anchorFromJson(o: JSONObject) = BalanceAnchorEntity(
@@ -896,6 +974,9 @@ object Backup {
         accountLabel = o.getString("accountLabel"),
         baselinePaise = o.getLong("baselinePaise"),
         anchoredAt = o.getLong("anchoredAt"),
+        accountType = AccountType.valueOf(o.optString("accountType", "BANK")),
+        accountLast4 = o.stringOrNull("accountLast4"),
+        openedAt = o.optLong("openedAt", 0L),
     )
 
     private fun profileToJson(p: UserProfileEntity) = JSONObject().apply {
@@ -942,6 +1023,36 @@ object Backup {
         updatedAt = o.getLong("updatedAt"),
         lastAlertedThreshold = o.optInt("lastAlertedThreshold", 0),
         lastAlertedPeriodStart = o.optLong("lastAlertedPeriodStart", 0L),
+    )
+
+    private fun categoryBudgetToJson(b: CategoryBudgetEntity) = JSONObject().apply {
+        put("category", b.category)
+        put("limitPaise", b.limitPaise)
+        put("rollover", b.rollover)
+        put("envelope", b.envelope)
+        put("updatedAt", b.updatedAt)
+        put("lastAlertedThreshold", b.lastAlertedThreshold)
+        put("lastAlertedPeriodStart", b.lastAlertedPeriodStart)
+    }
+
+    private fun categoryBudgetFromJson(o: JSONObject) = CategoryBudgetEntity(
+        category = o.getString("category"), limitPaise = o.getLong("limitPaise"),
+        rollover = o.optBoolean("rollover"), envelope = o.optBoolean("envelope"),
+        updatedAt = o.getLong("updatedAt"),
+        lastAlertedThreshold = o.optInt("lastAlertedThreshold"),
+        lastAlertedPeriodStart = o.optLong("lastAlertedPeriodStart"),
+    )
+
+    private fun instrumentToJson(i: PaymentInstrumentEntity) = JSONObject().apply {
+        put("id", i.id)
+        put("label", i.label)
+        put("vpa", i.vpa)
+        put("accountId", i.accountId)
+    }
+
+    private fun instrumentFromJson(o: JSONObject) = PaymentInstrumentEntity(
+        id = o.getString("id"), label = o.getString("label"), vpa = o.getString("vpa"),
+        accountId = o.getString("accountId"),
     )
 
     // ─────────────────────────────── JSON helpers ───────────────────────────────
