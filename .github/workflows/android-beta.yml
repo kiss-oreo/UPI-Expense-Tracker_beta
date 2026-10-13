@@ -20,6 +20,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - name: Diagnose SDK download
+        run: |
+          status=$(curl -L -s -o /dev/null --max-time 12 -w '%{http_code}' https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip || true)
+          echo "::warning title=SDK connectivity::Google commandline-tools HTTP $status; ANDROID_HOME=${ANDROID_HOME:-unset}; PATH sdkmanager=$(command -v sdkmanager || echo absent)"
+      - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '14742923'
+          packages: 'platform-tools'
       - name: Install Android 36.1 SDK
         run: |
           set -o pipefail
@@ -61,6 +69,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '14742923'
+          packages: 'platform-tools'
       - name: Install Android 36.1 SDK and API 29 emulator
         run: |
           yes | sdkmanager --licenses > /dev/null || true
