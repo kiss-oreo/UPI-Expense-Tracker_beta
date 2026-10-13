@@ -3,6 +3,8 @@ name: Android beta verification
 on:
   push:
     branches: [arena/bfda4e32-upi-expense-tracker-beta]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
