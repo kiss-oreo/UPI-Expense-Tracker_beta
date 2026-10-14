@@ -12,8 +12,10 @@ import androidx.room.TypeConverters
         UserProfileEntity::class,
         MerchantRuleEntity::class,
         BudgetEntity::class,
+        CategoryBudgetEntity::class,
+        PaymentInstrumentEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
@@ -24,4 +26,6 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun userProfileDao(): UserProfileDao
     abstract fun merchantRuleDao(): MerchantRuleDao
     abstract fun budgetDao(): BudgetDao
+    abstract fun categoryBudgetDao(): CategoryBudgetDao
+    abstract fun paymentInstrumentDao(): PaymentInstrumentDao
 }

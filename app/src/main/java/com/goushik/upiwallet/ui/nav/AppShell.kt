@@ -44,6 +44,7 @@ import com.goushik.upiwallet.ui.review.ReviewViewModel
 import com.goushik.upiwallet.ui.settings.AddAccountScreen
 import com.goushik.upiwallet.ui.settings.EditProfileScreen
 import com.goushik.upiwallet.ui.settings.LocationSettingsScreen
+import com.goushik.upiwallet.ui.settings.LinkUpiScreen
 import com.goushik.upiwallet.ui.settings.SettingsScreen
 import com.goushik.upiwallet.ui.settings.UpdateBalanceScreen
 import com.goushik.upiwallet.ui.theme.LocalHazeState
@@ -58,7 +59,7 @@ import dev.chrisbanes.haze.rememberHazeState
  * reachable from the Home hero's "↻ Update balance" pill. A Serializable enum, so it survives
  * rotation / process-death directly via `rememberSaveable`.
  */
-private enum class Overlay { UPDATE_BALANCE, ADD_ACCOUNT, EDIT_PROFILE, ADD_TXN, LOCATION_SETTINGS, ALL_TXNS, BUDGETS, REMOVED }
+private enum class Overlay { UPDATE_BALANCE, ADD_ACCOUNT, LINK_UPI, EDIT_PROFILE, ADD_TXN, EDIT_TXN, LOCATION_SETTINGS, ALL_TXNS, BUDGETS, REMOVED }
 
 /**
  * The post-onboarding host. A hand-rolled route holder (sealed [Route] + `rememberSaveable` + a
@@ -72,6 +73,7 @@ fun AppShell() {
     val hazeState = rememberHazeState()
     var route by rememberSaveable(stateSaver = RouteSaver) { mutableStateOf<Route>(Route.Home) }
     var detailId by rememberSaveable { mutableStateOf<String?>(null) }
+    var editingId by rememberSaveable { mutableStateOf<String?>(null) }
     var overlay by rememberSaveable { mutableStateOf<Overlay?>(null) }
     // Which window the Insights tab opens on. A Home stat-tile deep-link sets this before switching tab;
     // an enum is autoSaver-serializable (same as the Overlay holder above), so no custom Saver needed.
@@ -112,7 +114,8 @@ fun AppShell() {
                 val d = target.detailId
                 val o = target.overlay
                 when {
-                    d != null -> TransactionDetailScreen(txnId = d, onBack = { detailId = null })
+                    d != null -> TransactionDetailScreen(txnId = d, onBack = { detailId = null },
+                        onEdit = { id -> editingId = id; detailId = null; overlay = Overlay.EDIT_TXN })
 
                     o != null -> when (o) {
                         Overlay.UPDATE_BALANCE -> UpdateBalanceScreen(
@@ -120,8 +123,13 @@ fun AppShell() {
                             onAddAccount = { overlay = Overlay.ADD_ACCOUNT },
                         )
                         Overlay.ADD_ACCOUNT -> AddAccountScreen(onBack = { overlay = null })
+                        Overlay.LINK_UPI -> LinkUpiScreen(onBack = { overlay = null })
                         Overlay.EDIT_PROFILE -> EditProfileScreen(onBack = { overlay = null })
                         Overlay.ADD_TXN -> AddTransactionScreen(onBack = { overlay = null })
+                        Overlay.EDIT_TXN -> AddTransactionScreen(
+                            editingId = editingId,
+                            onBack = { detailId = editingId; editingId = null; overlay = null },
+                        )
                         Overlay.LOCATION_SETTINGS -> LocationSettingsScreen(onBack = { overlay = null })
                         Overlay.BUDGETS -> BudgetsScreen(onBack = { overlay = null })
                         Overlay.REMOVED -> com.goushik.upiwallet.ui.removed.RemovedPaymentsScreen(
@@ -167,6 +175,7 @@ fun AppShell() {
                             onEditProfile = { overlay = Overlay.EDIT_PROFILE },
                             onOpenLocation = { overlay = Overlay.LOCATION_SETTINGS },
                             onOpenBudgets = { overlay = Overlay.BUDGETS },
+                            onLinkUpi = { overlay = Overlay.LINK_UPI },
                             onOpenRemoved = { overlay = Overlay.REMOVED },
                         )
                     }

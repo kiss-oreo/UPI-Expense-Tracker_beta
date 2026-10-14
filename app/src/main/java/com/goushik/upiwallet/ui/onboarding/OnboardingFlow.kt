@@ -1,7 +1,6 @@
 package com.goushik.upiwallet.ui.onboarding
 
 import android.Manifest
-import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,14 +20,12 @@ import com.goushik.upiwallet.ui.common.IconAccessibility
 import com.goushik.upiwallet.ui.common.IconBattery
 import com.goushik.upiwallet.ui.common.IconSms
 import com.goushik.upiwallet.ui.common.rememberCaptureGrants
+import com.goushik.upiwallet.ui.common.rememberBackupRestorePicker
 import com.goushik.upiwallet.ui.theme.IconAccent
-import com.goushik.upiwallet.util.Backup
 import com.goushik.upiwallet.util.Ids
 import com.goushik.upiwallet.util.OemGuide
 import com.goushik.upiwallet.util.Permissions
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 private enum class Step {
     WELCOME,
@@ -84,31 +81,13 @@ fun OnboardingFlow() {
 
     // Reinstall path: pick a UET-backup file and restore. The data comes back but setup continues at the
     // capture steps it still needs (see the KDoc); with capture already fully on, it finishes right away.
-    val restoreLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        if (uri != null) {
-            ServiceLocator.appScope.launch {
-                val result = runCatching {
-                    Backup.restoreFromUri(ctx, ServiceLocator.db, uri, holdOnboarding = true)
-                }
-                withContext(Dispatchers.Main) {
-                    val msg = result.fold(
-                        onSuccess = { r -> Backup.restoreSummary(r) },
-                        onFailure = { it.message ?: "Couldn't restore that file" },
-                    )
-                    Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
-                    if (result.isSuccess) {
-                        val a11y = Permissions.isA11yEnabled(ctx)
-                        val sms = Permissions.isSmsGranted(ctx)
-                        when {
-                            !a11y -> step = Step.A11Y_TRY
-                            !sms -> step = Step.CAPTURE_REST
-                            else -> finishRestoredSetup()
-                        }
-                    }
-                }
-            }
+    val restoreLauncher = rememberBackupRestorePicker(holdOnboarding = true) {
+        val a11y = Permissions.isA11yEnabled(ctx)
+        val sms = Permissions.isSmsGranted(ctx)
+        when {
+            !a11y -> step = Step.A11Y_TRY
+            !sms -> step = Step.CAPTURE_REST
+            else -> finishRestoredSetup()
         }
     }
 

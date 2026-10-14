@@ -35,8 +35,9 @@ class UpiWalletApp : Application() {
                 repo.observeAnchors(),
                 repo.observeProfile(),
                 repo.observeBudgets(),
-            ) { txns, anchors, profile, budgets ->
-                WidgetSnapshot.build(txns, anchors, profile, budgets, System.currentTimeMillis())
+                repo.observeInstruments(),
+            ) { txns, anchors, profile, budgets, instruments ->
+                WidgetSnapshot.build(txns, anchors, profile, budgets, System.currentTimeMillis(), instruments)
             }.collect { snap -> WidgetUpdater.push(this@UpiWalletApp, snap) }
         }
     }

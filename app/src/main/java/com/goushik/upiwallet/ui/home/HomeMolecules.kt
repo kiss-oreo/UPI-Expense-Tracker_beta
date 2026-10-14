@@ -320,7 +320,7 @@ private fun ColumnScope.BalanceHeroContent(
             Modifier.fillMaxWidth().padding(top = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            accounts.forEach { AccountChip(it.label, "at setup", it.baselinePaise, Modifier.weight(1f)) }
+            accounts.forEach { AccountChip(it.label, "now", it.availablePaise, Modifier.weight(1f)) }
         }
     }
 }
@@ -421,7 +421,7 @@ private fun ColumnScope.SpendHeroContent(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (showingBalance) {
-                accounts.forEach { AccountChip(it.label, "at setup", it.baselinePaise, Modifier.weight(1f)) }
+                accounts.forEach { AccountChip(it.label, "now", it.availablePaise, Modifier.weight(1f)) }
             } else {
                 accountMonthSpend.forEach { AccountChip(it.label, "spent", it.spentPaise, Modifier.weight(1f)) }
             }

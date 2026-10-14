@@ -21,11 +21,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import com.goushik.upiwallet.ui.theme.WarnColor
@@ -35,6 +40,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.goushik.upiwallet.di.ServiceLocator
@@ -45,7 +51,7 @@ import com.goushik.upiwallet.ui.common.IconCheck
 import com.goushik.upiwallet.ui.common.IconChevronDown
 import com.goushik.upiwallet.ui.common.TogglePill
 import com.goushik.upiwallet.ui.common.rememberCaptureGrants
-import com.goushik.upiwallet.ui.donate.DonateButton
+import com.goushik.upiwallet.ui.common.rememberBackupRestorePicker
 import com.goushik.upiwallet.ui.nav.BottomNavHeight
 import com.goushik.upiwallet.ui.theme.GreenCredit
 import com.goushik.upiwallet.ui.theme.HairlineColor
@@ -77,6 +83,7 @@ fun SettingsScreen(
     onEditProfile: () -> Unit,
     onOpenLocation: () -> Unit,
     onOpenBudgets: () -> Unit,
+    onLinkUpi: () -> Unit = {},
     onOpenRemoved: () -> Unit = {},
 ) {
     val repo = ServiceLocator.repository
@@ -86,33 +93,99 @@ fun SettingsScreen(
     val anchors by repo.observeAnchors().collectAsStateWithLifecycle(emptyList())
     val profile by repo.observeProfile().collectAsStateWithLifecycle(null)
     val budgets by repo.observeBudgets().collectAsStateWithLifecycle(emptyList())
+    val categoryBudgets by repo.observeCategoryBudgets().collectAsStateWithLifecycle(emptyList())
+    val instruments by repo.observeInstruments().collectAsStateWithLifecycle(emptyList())
     val (grants, _) = rememberCaptureGrants()
     val ctx = LocalContext.current
 
-    // Restore: let the user pick a UET-backup file (SAF, no storage permission) and merge it back in.
-    // The toast says how old the file was and whether this phone's name / UPI IDs were kept.
-    val restoreLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
+    val restoreLauncher = rememberBackupRestorePicker()
+    var showEncryptedDialog by remember { mutableStateOf(false) }
+    var exportPassword by remember { mutableStateOf("") }
+    var exportConfirm by remember { mutableStateOf("") }
+    var exportSecret by remember { mutableStateOf<CharArray?>(null) }
+    var plaintextAction by remember { mutableStateOf<String?>(null) }
+    var autoPlaintext by remember { mutableStateOf(Backup.autoBackupEnabled(ctx)) }
+    val encryptedLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
     ) { uri ->
-        if (uri != null) {
+        val secret = exportSecret
+        exportSecret = null
+        if (uri != null && secret != null) {
             ServiceLocator.appScope.launch {
-                val result = runCatching { Backup.restoreFromUri(ctx, ServiceLocator.db, uri) }
+                val result = try {
+                    runCatching { Backup.writeEncryptedToUri(ctx, ServiceLocator.db, uri, secret) }
+                } finally { secret.fill('\u0000') }
                 withContext(Dispatchers.Main) {
-                    val msg = result.fold(
-                        onSuccess = { r -> Backup.restoreSummary(r) },
-                        onFailure = { it.message ?: "Couldn't restore that file" },
-                    )
-                    Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
+                    Toast.makeText(ctx, if (result.isSuccess) "Encrypted backup saved. Keep your password safe — it cannot be recovered."
+                        else result.exceptionOrNull()?.message ?: "Couldn't save the encrypted backup", Toast.LENGTH_LONG).show()
                 }
             }
-        }
+        } else secret?.fill('\u0000')
     }
 
-    val available = BalanceCalculator.available(
-        anchors, txns,
+    if (showEncryptedDialog) {
+        AlertDialog(
+            onDismissRequest = { showEncryptedDialog = false; exportPassword = ""; exportConfirm = "" },
+            title = { Text("Create encrypted backup") },
+            text = {
+                Column {
+                    Text("Choose a password of at least 8 characters. There is no password recovery. " +
+                        "Your chosen file location may sync if it is a cloud provider.")
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(exportPassword, { exportPassword = it }, label = { Text("Password") },
+                        visualTransformation = PasswordVisualTransformation(), singleLine = true)
+                    OutlinedTextField(exportConfirm, { exportConfirm = it }, label = { Text("Confirm password") },
+                        visualTransformation = PasswordVisualTransformation(), singleLine = true)
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = exportPassword.length >= 8 && exportPassword == exportConfirm,
+                    onClick = {
+                        exportSecret = exportPassword.toCharArray()
+                        exportPassword = ""; exportConfirm = ""; showEncryptedDialog = false
+                        encryptedLauncher.launch("UET-private-backup-${java.time.LocalDate.now()}.json")
+                    }) { Text("Choose location") }
+            },
+            dismissButton = { TextButton(onClick = {
+                showEncryptedDialog = false; exportPassword = ""; exportConfirm = ""
+            }) { Text("Cancel") } },
+        )
+    }
+    if (plaintextAction != null) {
+        AlertDialog(
+            onDismissRequest = { plaintextAction = null },
+            title = { Text("Unencrypted backup") },
+            text = { Text("The public Downloads file contains your payment history, captured screen " +
+                "text, bank SMS and optional locations. Other apps with file access or a connected " +
+                "computer can read it. Old unencrypted files remain until you delete them yourself. " +
+                "Use an encrypted backup instead if you need to keep this private.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val action = plaintextAction
+                    plaintextAction = null
+                    if (action == "auto") {
+                        autoPlaintext = true
+                        Backup.setAutoBackupEnabled(ctx, true)
+                    }
+                    ServiceLocator.appScope.launch {
+                        val result = runCatching { Backup.writeToDownloads(ctx, ServiceLocator.db) }
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(ctx, result.fold(
+                                onSuccess = { Backup.savedMessage(it.fileName, it.keptOlder) },
+                                onFailure = { "Couldn't save the backup. Any earlier file is unchanged." },
+                            ), Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }) { Text(if (plaintextAction == "auto") "Enable" else "Save unencrypted") }
+            },
+            dismissButton = { TextButton(onClick = { plaintextAction = null }) { Text("Cancel") } },
+        )
+    }
+
+    val ledger = BalanceCalculator.ledger(anchors, txns,
         ownVpas = profile?.ownVpaSet() ?: emptySet(),
-        ownNames = profile?.ownNameSet() ?: emptySet(),
-    )
+        ownNames = profile?.ownNameSet() ?: emptySet(), instruments = instruments)
+    val available = ledger.totalPaise
     // Post-onboarding there is always a profile + ≥1 anchor; the flows' initial (null / empty) values
     // just mean Room hasn't emitted yet. Guard so entry never flashes a wrong (even negative) balance.
     val ready = profile != null && anchors.isNotEmpty()
@@ -221,8 +294,16 @@ fun SettingsScreen(
                 Box(Modifier.alpha(if (showBalance) 1f else 0.45f)) {
                     SettingsCard {
                         SettingsRow("Available", if (ready) Money.format(available) else "—", first = true)
-                        anchors.forEach { a ->
-                            SettingsRow(a.accountLabel, Money.format(a.baselinePaise))
+                        ledger.accounts.forEach { row ->
+                            val a = row.account
+                            SettingsRow(a.accountLabel + " · " + a.accountType.name.lowercase(),
+                                Money.format(row.availablePaise),
+                                subtitle = a.accountLast4?.let { "Bank ••$it" })
+                        }
+                        if (ledger.unassignedCount > 0) {
+                            SettingsRow("Unassigned · ${ledger.unassignedCount} need review",
+                                Money.format(ledger.unassignedPaise),
+                                subtitle = "In total but not assigned to a bank; tap a payment to fix it")
                         }
                         SettingsRow("↻  Update balance", onClick = onUpdateBalance, chevron = true)
                     }
@@ -242,6 +323,9 @@ fun SettingsScreen(
                         "UPI IDs", subtitle = upiIdsSummary(upiIds) ?: "None added yet",
                         onClick = onEditProfile, chevron = true,
                     )
+                    SettingsRow("Linked payment instruments", "${instruments.size}",
+                        subtitle = "UPI IDs linked to bank accounts (no extra balance)",
+                        onClick = onLinkUpi, chevron = true)
                 }
             }
         }
@@ -262,37 +346,34 @@ fun SettingsScreen(
                             )
                         },
                     )
-                    val bs = backupStatus
                     SettingsRow(
-                        "Back up now",
-                        subtitle = when {
-                            bs == null || (bs.lastSuccessAt <= 0L && bs.lastFailureAt <= 0L) -> "Save a copy to your Downloads"
-                            bs.failing -> "Last backup failed ${DateTime.ago(bs.lastFailureAt)}. Your previous backup is safe."
-                            else -> "Last backup ${DateTime.ago(bs.lastSuccessAt)}" + (bs.fileName?.let { " · $it" } ?: "")
-                        },
-                        subtitleColor = if (bs?.failing == true) RedDebit else null,
-                        chevron = true,
-                        onClick = {
-                            ServiceLocator.appScope.launch {
-                                val result = runCatching { Backup.writeToDownloads(ctx, ServiceLocator.db) }
-                                withContext(Dispatchers.Main) {
-                                    // Name the file MediaStore really wrote: after a reinstall it's
-                                    // "UET-backup (N).json", and the plain name is the old install's.
-                                    val msg = result.fold(
-                                        onSuccess = { Backup.savedMessage(it.fileName, it.keptOlder) },
-                                        onFailure = {
-                                            "Couldn't save the backup. Any earlier backup file is left as it was."
-                                        },
-                                    )
-                                    Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
-                                }
+                        "Encrypted backup", subtitle = "Password-protected · choose where to save",
+                        chevron = true, onClick = { showEncryptedDialog = true },
+                    )
+                    SettingsRow(
+                        "Restore a backup", subtitle = "Encrypted or legacy JSON · merges without duplicates",
+                        chevron = true, onClick = { restoreLauncher.launch(arrayOf("application/json")) },
+                    )
+                    ToggleRow(
+                        "Auto-save plaintext to Downloads",
+                        if (autoPlaintext) "On — readable by other apps with file access" else "Off (recommended)",
+                        on = autoPlaintext,
+                        onToggle = { enable ->
+                            if (enable) plaintextAction = "auto" else {
+                                autoPlaintext = false
+                                Backup.setAutoBackupEnabled(ctx, false)
                             }
                         },
                     )
+                    val bs = backupStatus
                     SettingsRow(
-                        "Restore from a backup", subtitle = "Pick your newest UET-backup file",
-                        chevron = true,
-                        onClick = { restoreLauncher.launch(arrayOf("application/json")) },
+                        "Legacy unencrypted backup",
+                        subtitle = if (bs?.failing == true) "Last attempt failed ${DateTime.ago(bs.lastFailureAt)}"
+                            else if (bs != null && bs.lastSuccessAt > 0L)
+                                "Last saved ${DateTime.ago(bs.lastSuccessAt)} · ${bs.fileName.orEmpty()}"
+                            else "One-time plaintext copy to Downloads",
+                        subtitleColor = if (bs?.failing == true) RedDebit else null,
+                        chevron = true, onClick = { plaintextAction = "once" },
                     )
                     SettingsRow(
                         "Removed payments",
@@ -305,10 +386,11 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "Your data lives only on this phone, so uninstalling clears it. A backup is auto-saved " +
-                        "to your Downloads and updates as you spend — keep that file (or copy it to Drive) and " +
-                        "you can restore everything after reinstalling. It holds the text of your captured " +
-                        "payment screens and bank SMS, and rounded payment locations, so keep it private.",
+                    "Uninstalling deletes the private database. Save an encrypted backup first and " +
+                        "remember its password; restore it from Welcome after reinstalling. Automatic " +
+                        "plaintext backups are off by default. Existing unencrypted Downloads files are " +
+                        "not deleted on upgrade — remove them yourself if no longer needed. A chosen cloud " +
+                        "provider may sync an exported file even though this app cannot use the Internet.",
                     style = MaterialTheme.typography.bodySmall, color = TextTertiary,
                     modifier = Modifier.padding(start = 2.dp),
                 )
@@ -317,13 +399,13 @@ fun SettingsScreen(
 
         // ── Budgets (Phase 2) ──
         item {
-            val setCount = budgets.count { it.limitPaise > 0L }
+            val setCount = budgets.count { it.limitPaise > 0L } + categoryBudgets.count { it.limitPaise > 0L }
             SettingsSection("Budgets") {
                 SettingsCard {
                     SettingsRow(
                         "Budgets",
                         value = if (setCount > 0) "$setCount set" else null,
-                        subtitle = "Daily, weekly, monthly limits",
+                        subtitle = "Daily, weekly, monthly and category envelopes",
                         first = true, chevron = true, onClick = onOpenBudgets,
                     )
                 }
@@ -352,27 +434,6 @@ fun SettingsScreen(
             }
         }
 
-        // ── Support (Phase 3 — the pixelated-you donate button; sits directly on the aurora, no glass card) ──
-        item {
-            SettingsSection("Support") {
-                DonateButton()
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    "This app is free and stays on your phone. If it saved you some taps, a small tip " +
-                        "helps keep it going.",
-                    style = MaterialTheme.typography.bodyMedium, color = TextSecondary,
-                    modifier = Modifier.padding(start = 2.dp),
-                )
-                Spacer(Modifier.height(14.dp))
-                Text(
-                    "Optional. Tapping opens a secure donate page in your browser — the app itself " +
-                        "never handles money.",
-                    style = MaterialTheme.typography.bodySmall, color = TextTertiary,
-                    modifier = Modifier.padding(start = 2.dp),
-                )
-            }
-        }
-
         // ── About — kept LAST so it sits at the very bottom of Settings ──
         item {
             SettingsSection("About") {
@@ -380,8 +441,8 @@ fun SettingsScreen(
                 Spacer(Modifier.height(12.dp))
                 Text(
                     // Fully offline — the app has no INTERNET permission, so this claim is enforced, not aspirational.
-                    "Everything stays on your phone — we never connect to your bank, and nothing ever " +
-                        "leaves your device.",
+                    "No Internet permission; the app never connects to a bank or uploads your data. " +
+                        "Files you explicitly export or share can leave your device.",
                     style = MaterialTheme.typography.bodySmall, color = TextTertiary,
                     modifier = Modifier.padding(start = 2.dp),
                 )

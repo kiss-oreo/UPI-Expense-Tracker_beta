@@ -16,6 +16,13 @@ interface TransactionDao {
     @Update
     suspend fun update(txn: TransactionEntity)
 
+    /** Only user-owned fields on a captured row: never replace the reconciler's RRN/status/source. */
+    @Query("UPDATE transactions SET accountId = :accountId, instrumentId = :instrumentId, note = :note WHERE id = :id")
+    suspend fun updateAttribution(id: String, accountId: String?, instrumentId: String?, note: String?)
+
+    @Query("UPDATE transactions SET kind = :kind WHERE id = :id AND source != 'manual' AND status != 'DISCARDED'")
+    suspend fun markCaptureKind(id: String, kind: TxnKind)
+
     @Query("SELECT * FROM transactions ORDER BY timestampEvent DESC")
     fun observeAll(): Flow<List<TransactionEntity>>
 

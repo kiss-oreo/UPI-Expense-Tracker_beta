@@ -3,6 +3,14 @@ package com.goushik.upiwallet.data
 /** Spend vs income. A confirm-sheet capture is always a DEBIT; credits arrive only via SMS. */
 enum class Direction { DEBIT, CREDIT }
 
+/** Null on pre-2.0/captured rows: their direction and self-transfer evidence still decide the type.
+ * Explicit types are used for user-entered entries. A transfer is ONE row with two account IDs, never
+ * two expenses; refunds and repayments change balances but not gross spending/income. */
+enum class TxnKind { EXPENSE, INCOME, TRANSFER, REFUND, REPAYMENT }
+
+/** Physical money containers. A linked UPI ID is a payment instrument, NOT another account/balance. */
+enum class AccountType { BANK, CASH, CARD, WALLET }
+
 /**
  * Lifecycle of a captured transaction.
  * - PENDING      captured (confirm sheet), episode still open / no proof yet

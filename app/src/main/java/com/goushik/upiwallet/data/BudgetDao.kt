@@ -23,6 +23,7 @@ interface BudgetDao {
     suspend fun delete(period: String)
 
     /** Record that we've nudged [threshold] for the window starting [periodStart] — the dedup marker. */
-    @Query("UPDATE budgets SET lastAlertedThreshold = :threshold, lastAlertedPeriodStart = :periodStart WHERE period = :period")
-    suspend fun markAlerted(period: String, threshold: Int, periodStart: Long)
+    @Query("UPDATE budgets SET lastAlertedThreshold = :threshold, lastAlertedPeriodStart = :periodStart " +
+        "WHERE period = :period AND (lastAlertedPeriodStart != :periodStart OR lastAlertedThreshold < :threshold)")
+    suspend fun markAlerted(period: String, threshold: Int, periodStart: Long): Int
 }

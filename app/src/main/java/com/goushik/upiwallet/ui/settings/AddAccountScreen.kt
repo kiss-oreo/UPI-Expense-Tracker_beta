@@ -36,7 +36,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.goushik.upiwallet.data.BalanceAnchorEntity
+import com.goushik.upiwallet.data.AccountType
 import com.goushik.upiwallet.di.ServiceLocator
 import com.goushik.upiwallet.domain.BalanceCalculator
 import com.goushik.upiwallet.ui.common.FieldLabel
@@ -47,6 +47,7 @@ import com.goushik.upiwallet.ui.common.PrimaryButton
 import com.goushik.upiwallet.ui.common.WalletTextField
 import com.goushik.upiwallet.ui.theme.GreenCredit
 import com.goushik.upiwallet.ui.theme.HairlineColor
+import com.goushik.upiwallet.ui.theme.RedDebit
 import com.goushik.upiwallet.ui.theme.TextPrimary
 import com.goushik.upiwallet.ui.theme.TextSecondary
 import com.goushik.upiwallet.ui.theme.TextTertiary
@@ -55,9 +56,11 @@ import com.goushik.upiwallet.ui.theme.WalletShapes
 import com.goushik.upiwallet.ui.theme.glassSurface
 import com.goushik.upiwallet.util.Ids
 import com.goushik.upiwallet.util.Money
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-private fun moneyFilter(s: String): String = s.filter { it.isDigit() || it == '.' || it == ',' }
+private fun moneyFilter(s: String): String = s.filter { it.isDigit() || it == '.' || it == ',' || it == '-' }
 
 /** Banks the per-account spend matcher (domain/AccountMatch) can canonicalise — tapping a chip pre-fills
  *  the name so attribution works. Any other bank is still fine to type (the balance is a global sum). */
@@ -110,33 +113,55 @@ private fun TopBar(onBack: () -> Unit) {
 private fun AddForm(onAdded: () -> Unit) {
     var name by remember { mutableStateOf("") }
     var amount by remember { mutableStateOf("") }
+    var kind by remember { mutableStateOf(AccountType.BANK) }
+    var last4 by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
     val parsed = Money.parsePaise(amount)
-    val valid = name.isNotBlank() && parsed != null && parsed >= 0
+    val valid = name.isNotBlank() && parsed != null && (last4.isBlank() ||
+        (kind == AccountType.BANK && last4.length == 4 && last4.all(Char::isDigit)))
 
     Spacer(Modifier.height(12.dp))
-    Text("Add a bank account", style = MaterialTheme.typography.headlineLarge, color = TextPrimary)
+    Text("Add an account", style = MaterialTheme.typography.headlineLarge, color = TextPrimary)
     Spacer(Modifier.height(10.dp))
     Text(
-        "Add another bank and its current balance. It won't touch your other accounts — we just add " +
-            "this one to your wallet.",
+        "Keep cash, banks, cards and wallets separate. Link a UPI ID to a bank later — a UPI ID " +
+            "does not have its own balance. For cards, a negative opening balance means money owed.",
         style = MaterialTheme.typography.bodyLarge, color = TextSecondary,
     )
     Spacer(Modifier.height(24.dp))
 
-    FieldLabel("Bank / account name")
-    FlowRow(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        COMMON_BANKS.forEach { bank ->
-            BankChip(bank, selected = name.equals(bank, ignoreCase = true), onClick = { name = bank })
+    FieldLabel("Type")
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        AccountType.entries.forEach { type ->
+            BankChip(type.name.lowercase().replaceFirstChar { it.uppercase() }, kind == type) {
+                kind = type
+                if (type != AccountType.BANK) last4 = ""
+            }
         }
     }
-    Spacer(Modifier.height(10.dp))
+    Spacer(Modifier.height(18.dp))
+    FieldLabel("Account name")
+    if (kind == AccountType.BANK) {
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            COMMON_BANKS.forEach { bank ->
+                BankChip(bank, selected = name.equals(bank, ignoreCase = true), onClick = { name = bank })
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+    }
     WalletTextField(
-        name, { name = it }, placeholder = "e.g. Federal Bank",
+        name, { name = it }, placeholder = if (kind == AccountType.BANK) "e.g. Federal Bank" else "e.g. Cash in hand",
         textStyle = MaterialTheme.typography.titleLarge,
     )
+    if (kind == AccountType.BANK) {
+        Spacer(Modifier.height(16.dp))
+        FieldLabel("Bank account last 4", "optional; helps match bank SMS")
+        WalletTextField(last4, { last4 = it.filter(Char::isDigit).take(4) }, placeholder = "e.g. 1234",
+            keyboardType = KeyboardType.Number)
+    }
 
     Spacer(Modifier.height(18.dp))
     FieldLabel("Current balance")
@@ -145,20 +170,25 @@ private fun AddForm(onAdded: () -> Unit) {
         keyboardType = KeyboardType.Decimal, textStyle = MaterialTheme.typography.headlineMedium,
     )
     Spacer(Modifier.height(14.dp))
-    HintRow("Read it from your bank app — a starting point, not a login.")
+    HintRow("Your opening balance is a snapshot; transfers and payments update it from here.")
+    error?.let {
+        Spacer(Modifier.height(10.dp))
+        Text(it, style = MaterialTheme.typography.bodySmall, color = RedDebit)
+    }
 
     Spacer(Modifier.height(24.dp))
     PrimaryButton(
         "Add account",
         onClick = {
-            // Process-scoped so the insert completes even as AppShell swaps this composable out on back.
+            val label = name.trim()
+            val type = kind
+            val paise = parsed ?: return@PrimaryButton
+            val tail = last4.ifBlank { null }
             ServiceLocator.appScope.launch {
-                val repo = ServiceLocator.repository
-                val existing = repo.anchors()
-                val stamp = BalanceCalculator.anchorStampFor(existing, System.currentTimeMillis())
-                repo.upsertAnchor(BalanceAnchorEntity(Ids.uuid7(), name.trim(), Money.parsePaise(amount)!!, stamp))
+                runCatching { ServiceLocator.repository.addAccount(label, type, paise, tail) }
+                    .onSuccess { withContext(Dispatchers.Main) { onAdded() } }
+                    .onFailure { withContext(Dispatchers.Main) { error = it.message ?: "Couldn't add account" } }
             }
-            onAdded()
         },
         enabled = valid,
     )

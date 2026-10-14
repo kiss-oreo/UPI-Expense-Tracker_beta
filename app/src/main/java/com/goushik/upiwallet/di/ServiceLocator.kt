@@ -97,6 +97,34 @@ private val MIGRATION_6_7 = object : Migration(6, 7) {
     }
 }
 
+/** v7→v8: keep all captures, balances, profile and backups intact; add *stable* account references
+ * and optional typed transactions. Null type on old rows deliberately retains 1.x self-transfer
+ * detection. New UPI payment instruments do not carry balances. No destructive fallback. */
+internal val MIGRATION_7_8 = object : Migration(7, 8) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE balance_anchors ADD COLUMN accountType TEXT NOT NULL DEFAULT 'BANK'")
+        db.execSQL("ALTER TABLE balance_anchors ADD COLUMN accountLast4 TEXT")
+        db.execSQL("ALTER TABLE balance_anchors ADD COLUMN openedAt INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE transactions ADD COLUMN kind TEXT")
+        db.execSQL("ALTER TABLE transactions ADD COLUMN accountId TEXT")
+        db.execSQL("ALTER TABLE transactions ADD COLUMN toAccountId TEXT")
+        db.execSQL("ALTER TABLE transactions ADD COLUMN instrumentId TEXT")
+        db.execSQL("ALTER TABLE transactions ADD COLUMN note TEXT")
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_transactions_accountId ON transactions (accountId)")
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS payment_instruments (" +
+                "id TEXT NOT NULL PRIMARY KEY, label TEXT NOT NULL, vpa TEXT NOT NULL, accountId TEXT NOT NULL)",
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS index_payment_instruments_accountId ON payment_instruments (accountId)")
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS category_budgets (" +
+                "category TEXT NOT NULL PRIMARY KEY, limitPaise INTEGER NOT NULL, rollover INTEGER NOT NULL, " +
+                "envelope INTEGER NOT NULL, updatedAt INTEGER NOT NULL, " +
+                "lastAlertedThreshold INTEGER NOT NULL, lastAlertedPeriodStart INTEGER NOT NULL)",
+        )
+    }
+}
+
 /**
  * Manual DI (no Hilt, per project convention). Initialized once from UpiWalletApp.onCreate with the
  * application context, so background services / the SMS receiver / WorkManager can reach the DB
@@ -142,6 +170,7 @@ object ServiceLocator {
                 "upiwallet.db",
             ).addMigrations(
                 MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
+                MIGRATION_7_8,
             ).build()
             repository = TransactionRepository(db)
             reconciler = Reconciler(db)
@@ -179,9 +208,11 @@ object ServiceLocator {
                 repository.observeTransactions().map { },
                 repository.observeAnchors().map { },
                 repository.observeBudgets().map { },
+                repository.observeCategoryBudgets().map { },
+                repository.observeInstruments().map { },
                 repository.observeProfile().map { },
             ).debounce(BACKUP_DEBOUNCE_MS).collect {
-                if (repository.profile()?.onboardedAt == null) return@collect
+                if (!Backup.autoBackupEnabled(appContext) || repository.profile()?.onboardedAt == null) return@collect
                 runCatching { Backup.writeToDownloads(appContext, db) }
                     .onFailure { t -> Dbg.w { "auto-backup failed: ${t.javaClass.simpleName}" } }
             }

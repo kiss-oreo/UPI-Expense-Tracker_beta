@@ -1,6 +1,7 @@
 package com.goushik.upiwallet.domain.insights
 
 import com.goushik.upiwallet.data.Direction
+import com.goushik.upiwallet.data.TxnKind
 import com.goushik.upiwallet.data.TransactionEntity
 import com.goushik.upiwallet.data.TxnStatus
 import com.goushik.upiwallet.domain.BalanceCalculator
@@ -124,6 +125,7 @@ fun categoryRollup(
 fun isSpend(txn: TransactionEntity, ownVpas: Set<String>, ownNames: Set<String>): Boolean =
     txn.status != TxnStatus.DISCARDED &&
         txn.direction == Direction.DEBIT &&
+        (txn.kind == null || txn.kind == TxnKind.EXPENSE) &&
         !BalanceCalculator.isSelfTransfer(txn, ownVpas, ownNames)
 
 /** The half-open spend window for a period: a payment counts iff startMs <= timestampEvent < endMs. */

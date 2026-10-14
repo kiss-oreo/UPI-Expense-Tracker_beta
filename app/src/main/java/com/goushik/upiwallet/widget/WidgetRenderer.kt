@@ -99,7 +99,7 @@ object WidgetRenderer {
                 setImageViewResource(R.id.eye_icon, if (revealed) R.drawable.ic_widget_eye_open else R.drawable.ic_widget_eye_off)
                 setTextViewText(R.id.eye_label, if (revealed) "Hide" else "Reveal")
                 setOnClickPendingIntent(R.id.eye_pill, toggleReveal(context, id))
-                // Per-account chips (up to two) — "at setup" baselines, masked together with the balance.
+                // Per-account chips (up to two) — current balances, masked together with the total.
                 bindChip(this, snap.accounts.getOrNull(0), R.id.chip1, R.id.chip1_label, R.id.chip1_value, revealed)
                 bindChip(this, snap.accounts.getOrNull(1), R.id.chip2, R.id.chip2_label, R.id.chip2_value, revealed)
             } else {
@@ -139,8 +139,8 @@ object WidgetRenderer {
             return
         }
         rv.setViewVisibility(chipId, View.VISIBLE)
-        rv.setTextViewText(labelId, "${account.label} · at setup")
-        rv.setTextViewText(valueId, if (revealed) Money.formatParts(account.baselinePaise).first else mask(account.baselinePaise))
+        rv.setTextViewText(labelId, "${account.label} · now")
+        rv.setTextViewText(valueId, if (revealed) Money.formatParts(account.availablePaise).first else mask(account.availablePaise))
     }
 
     // The money-stack budget meter: the bottom `litTiers` note-slots are lit (money left), the rest ghosts.
