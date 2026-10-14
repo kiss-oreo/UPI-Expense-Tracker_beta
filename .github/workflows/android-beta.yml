@@ -51,54 +51,63 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "Declared in app/build.gradle.kts: versionCode $code, versionName $name" >> "$GITHUB_STEP_SUMMARY"
-      - name: Unit tests, lint, debug and release builds
+      - name: Unit tests and debug + release builds
         run: |
-          ./gradlew --no-daemon :app:testDebugUnitTest :app:lint :app:assembleDebug :app:assembleRelease > gradle-build.log 2>&1 || {
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease > gradle-build.log 2>&1 || {
             echo "::error title=Gradle build output::$(tail -n 160 gradle-build.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
             exit 1
           }
-      - name: Summarise unit tests and lint
+      - name: Verify the built APKs (version, package id, minSdk 29, no INTERNET, signature, size, SHA-256)
+        run: |
+          python3 .github/scripts/verify_beta_apk.py \
+            --report app/build/reports/beta-verification.txt \
+            --checksums app/build/outputs/checksums.txt
+      # Runs LAST among the checks so a lint error can never hide the build+APK results above. Gradle
+      # prints only the first lint error, so .github/scripts/lint_report.py prints all of them.
+      - name: Lint
+        run: |
+          set -o pipefail
+          status=0
+          ./gradlew --no-daemon :app:lint > gradle-lint.log 2>&1 || status=$?
+          python3 .github/scripts/lint_report.py
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=Lint failed::$(tail -n 40 gradle-lint.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
+          fi
+          exit "$status"
+      - name: Summarise unit tests
         if: always()
         run: |
-          python3 - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          python3 - <<'PY'
           import glob
+          import os
           import xml.etree.ElementTree as ET
 
-          summary = open(__import__("os").environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8")
-          summary.write("### Unit tests (`:app:testDebugUnitTest`)\n")
+          lines = ["### Unit tests (`:app:testDebugUnitTest`)"]
           files = sorted(glob.glob("app/build/test-results/testDebugUnitTest/*.xml"))
           if not files:
-              summary.write("No test results were produced — the test task did not reach the point of running tests.\n")
+              lines.append("No test results were produced — the test task did not reach the point of running tests.")
           else:
               totals = dict.fromkeys(("tests", "failures", "errors", "skipped"), 0)
               for path in files:
                   root = ET.parse(path).getroot()
                   for key in totals:
                       totals[key] += int(root.get(key, 0))
-              summary.write(
+              lines.append(
                   f"{len(files)} test classes · **{totals['tests']} tests**, "
-                  f"{totals['failures']} failures, {totals['errors']} errors, {totals['skipped']} skipped\n"
+                  f"{totals['failures']} failures, {totals['errors']} errors, {totals['skipped']} skipped"
               )
               for path in files:
                   root = ET.parse(path).getroot()
                   for case in root.iter("testcase"):
                       for bad in list(case.findall("failure")) + list(case.findall("error")):
                           message = (bad.get("message") or bad.get("type") or "").replace("\n", " ")[:200]
-                          summary.write(f"- `{case.get('classname')}.{case.get('name')}` — {message}\n")
-          summary.write("\n### Lint (`:app:lint`)\n")
-          try:
-              report = [line.rstrip() for line in open("app/build/reports/lint-results-debug.txt", encoding="utf-8") if line.strip()]
-          except FileNotFoundError:
-              summary.write("No lint report was produced.\n")
-          else:
-              summary.write("```\n" + "\n".join(report[-25:]) + "\n```\n")
-          summary.close()
+                          lines.append(f"- `{case.get('classname')}.{case.get('name')}` — {message}")
+          print("\n".join(lines))
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write("\n".join(lines) + "\n")
           PY
-      - name: Verify the built APKs (version, package id, minSdk 29, no INTERNET, signature, size, SHA-256)
-        run: |
-          python3 .github/scripts/verify_beta_apk.py \
-            --report app/build/reports/beta-verification.txt \
-            --checksums app/build/outputs/checksums.txt
       - name: Upload the debug test-copy APK
         uses: actions/upload-artifact@v4
         with:

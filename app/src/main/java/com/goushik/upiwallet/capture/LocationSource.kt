@@ -113,6 +113,12 @@ object LocationSource {
         for (p in providers) {
             val loc = try {
                 lm.getLastKnownLocation(p)
+            } catch (e: SecurityException) {
+                // FINE can be revoked between the caller's check and this read; a revoked grant must drop
+                // the fix, not crash the capture. The type is explicit because lint's MissingPermission
+                // check needs to see SecurityException handled here (an `Exception` catch does not tell it
+                // that) — exactly as currentFix above does it.
+                null
             } catch (e: Exception) {
                 null
             } ?: continue
