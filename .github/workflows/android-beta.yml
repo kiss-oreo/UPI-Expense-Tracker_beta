@@ -33,15 +33,9 @@ jobs:
         with:
           cmdline-tools-version: '14742923'
           packages: 'platform-tools'
+      # Retries a truncated SDK download (a runner once failed to unzip platform-29_r05.zip).
       - name: Install Android 36.1 and Android 10 (API 29) SDKs
-        run: |
-          set -o pipefail
-          echo "Android SDK: $ANDROID_HOME; sdkmanager: $(command -v sdkmanager || true)"
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install 'platforms;android-36.1' 'platforms;android-29' 'build-tools;36.0.0' 'platform-tools' > sdk-install.log 2>&1 || {
-            echo "::error title=SDK setup::$(tail -n 45 sdk-install.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
-            exit 1
-          }
+        run: bash .github/scripts/install_android_sdk.sh 'platforms;android-36.1' 'platforms;android-29' 'build-tools;36.0.0' 'platform-tools'
       - name: Read the version the build script declares
         id: version
         run: |
@@ -136,10 +130,9 @@ jobs:
         with:
           cmdline-tools-version: '14742923'
           packages: 'platform-tools'
+      # Same retry wrapper — the emulator + system image are the largest downloads in the run.
       - name: Install Android 36.1 SDK and the API 29 emulator
-        run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install 'platforms;android-36.1' 'platforms;android-29' 'build-tools;36.0.0' 'platform-tools' 'emulator' 'system-images;android-29;default;x86_64'
+        run: bash .github/scripts/install_android_sdk.sh 'platforms;android-36.1' 'platforms;android-29' 'build-tools;36.0.0' 'platform-tools' 'emulator' 'system-images;android-29;default;x86_64'
       # BetaSmokeTest checks on a real Android 10 device image that the app installs, launches, carries no
       # INTERNET permission, and migrates a populated v7 database without losing a payment or an account.
       - uses: reactivecircus/android-emulator-runner@v2
