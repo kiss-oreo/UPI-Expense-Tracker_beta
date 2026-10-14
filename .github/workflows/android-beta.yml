@@ -1,8 +1,12 @@
 name: Android beta verification
 
+# Builds the 2.1.0-beta.1 test copy, proves it on a real Android 10 (API 29) emulator, and publishes the
+# debug APK as an artifact — but ONLY after .github/scripts/verify_beta_apk.py has checked the actual
+# binary (package id, version, minSdk 29, no INTERNET, debug-key signature, size, SHA-256). A build that
+# fails any check fails the job and uploads nothing, so a broken APK never reaches a phone.
 on:
   push:
-    branches: [arena/bfda4e32-upi-expense-tracker-beta]
+    branches: ['arena/**', main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -10,25 +14,26 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  verify:
+    name: Unit tests, lint, debug + release builds, APK checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
-      - name: Diagnose SDK download
-        run: |
-          status=$(curl -L -s -o /dev/null --max-time 12 -w '%{http_code}' https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip || true)
-          echo "::warning title=SDK connectivity::Google commandline-tools HTTP $status; ANDROID_HOME=${ANDROID_HOME:-unset}; PATH sdkmanager=$(command -v sdkmanager || echo absent)"
       - uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: '14742923'
           packages: 'platform-tools'
-      - name: Install Android 36.1 SDK
+      - name: Install Android 36.1 and Android 10 (API 29) SDKs
         run: |
           set -o pipefail
           echo "Android SDK: $ANDROID_HOME; sdkmanager: $(command -v sdkmanager || true)"
@@ -37,32 +42,79 @@ jobs:
             echo "::error title=SDK setup::$(tail -n 45 sdk-install.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
             exit 1
           }
-      - name: Unit tests and debug APK
+      - name: Read the version the build script declares
+        id: version
         run: |
-          ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug > gradle-build.log 2>&1 || {
+          set -euo pipefail
+          code=$(grep -oP '^\s*versionCode = \K[0-9]+' app/build.gradle.kts | head -1)
+          name=$(grep -oP '^\s*versionName = "\K[^"]+' app/build.gradle.kts | head -1)
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "Declared in app/build.gradle.kts: versionCode $code, versionName $name" >> "$GITHUB_STEP_SUMMARY"
+      - name: Unit tests, lint, debug and release builds
+        run: |
+          ./gradlew --no-daemon :app:testDebugUnitTest :app:lint :app:assembleDebug :app:assembleRelease > gradle-build.log 2>&1 || {
             echo "::error title=Gradle build output::$(tail -n 160 gradle-build.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
             exit 1
           }
-      - name: Verify Android 10 minimum and absence of network permission
-        run: |
-          APK=app/build/outputs/apk/debug/app-debug.apk
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep "sdkVersion:'29'"
-          if "$ANDROID_HOME/build-tools/36.0.0/aapt" dump permissions "$APK" | grep -F 'android.permission.INTERNET'; then
-            echo 'INTERNET was reintroduced in the merged manifest' >&2
-            exit 1
-          fi
-      - uses: actions/upload-artifact@v4
+      - name: Summarise unit tests and lint
         if: always()
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import glob
+          import xml.etree.ElementTree as ET
+
+          summary = open(__import__("os").environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8")
+          summary.write("### Unit tests (`:app:testDebugUnitTest`)\n")
+          files = sorted(glob.glob("app/build/test-results/testDebugUnitTest/*.xml"))
+          if not files:
+              summary.write("No test results were produced — the test task did not reach the point of running tests.\n")
+          else:
+              totals = dict.fromkeys(("tests", "failures", "errors", "skipped"), 0)
+              for path in files:
+                  root = ET.parse(path).getroot()
+                  for key in totals:
+                      totals[key] += int(root.get(key, 0))
+              summary.write(
+                  f"{len(files)} test classes · **{totals['tests']} tests**, "
+                  f"{totals['failures']} failures, {totals['errors']} errors, {totals['skipped']} skipped\n"
+              )
+              for path in files:
+                  root = ET.parse(path).getroot()
+                  for case in root.iter("testcase"):
+                      for bad in list(case.findall("failure")) + list(case.findall("error")):
+                          message = (bad.get("message") or bad.get("type") or "").replace("\n", " ")[:200]
+                          summary.write(f"- `{case.get('classname')}.{case.get('name')}` — {message}\n")
+          summary.write("\n### Lint (`:app:lint`)\n")
+          try:
+              report = [line.rstrip() for line in open("app/build/reports/lint-results-debug.txt", encoding="utf-8") if line.strip()]
+          except FileNotFoundError:
+              summary.write("No lint report was produced.\n")
+          else:
+              summary.write("```\n" + "\n".join(report[-25:]) + "\n```\n")
+          summary.close()
+          PY
+      - name: Verify the built APKs (version, package id, minSdk 29, no INTERNET, signature, size, SHA-256)
+        run: |
+          python3 .github/scripts/verify_beta_apk.py \
+            --report app/build/reports/beta-verification.txt \
+            --checksums app/build/outputs/checksums.txt
+      - name: Upload the debug test-copy APK
+        uses: actions/upload-artifact@v4
         with:
-          name: upi-tracker-2.0.0-beta.1-debug-test-copy
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: ignore
+          name: upi-tracker-${{ steps.version.outputs.name }}-debug-test-copy
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/checksums.txt
+            app/build/reports/beta-verification.txt
+          if-no-files-found: error
           retention-days: 14
 
   android-10-smoke:
-    needs: build
+    name: API 29 instrumentation smoke tests
+    needs: verify
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
@@ -73,10 +125,12 @@ jobs:
         with:
           cmdline-tools-version: '14742923'
           packages: 'platform-tools'
-      - name: Install Android 36.1 SDK and API 29 emulator
+      - name: Install Android 36.1 SDK and the API 29 emulator
         run: |
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install 'platforms;android-36.1' 'platforms;android-29' 'build-tools;36.0.0' 'platform-tools' 'emulator' 'system-images;android-29;default;x86_64'
+      # BetaSmokeTest checks on a real Android 10 device image that the app installs, launches, carries no
+      # INTERNET permission, and migrates a populated v7 database without losing a payment or an account.
       - uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 29
@@ -84,3 +138,13 @@ jobs:
           arch: x86_64
           disable-animations: true
           script: ./gradlew --no-daemon :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.goushik.upiwallet.release.BetaSmokeTest
+      - name: Upload instrumentation results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-results
+          path: |
+            app/build/reports/androidTests/**
+            app/build/outputs/androidTest-results/**
+          if-no-files-found: ignore
+          retention-days: 7

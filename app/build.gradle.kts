@@ -29,8 +29,12 @@ android {
         // are available there; notifications and scoped-storage paths are guarded at their own API levels.
         minSdk = 29
         targetSdk = 36
-        versionCode = 10
-        versionName = "2.0.0-beta.1"
+        // 2.1.0-beta.1 is a TEST-CORRECTNESS build, not a production-signed release: CI builds it, the
+        // debug variant ships as a side-by-side ".debug" test copy (instructions in the README), and the
+        // release variant stays unsigned until the permanent keystore exists. Bumping versionCode here is
+        // what a future signed release would use, so the beta and the real app cannot be confused.
+        versionCode = 11
+        versionName = "2.1.0-beta.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
