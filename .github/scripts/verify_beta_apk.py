@@ -194,7 +194,7 @@ def main() -> int:
     for apk in (debug_apk, release_apk):
         check(apk.is_file(), f"built {apk.name}", str(apk))
     if not all(apk.is_file() for apk in (debug_apk, release_apk)):
-        return finish(args, debug_apk, release_apk)
+        return finish(args, debug_apk, release_apk, aapt)
 
     # ── debug: the side-by-side test copy ───────────────────────────────────────────────────────────
     debug_badge = verify_common(
@@ -251,10 +251,10 @@ def main() -> int:
              "unsigned — expected in CI: no keystore.properties, so this is not a production-signed "
              "update and must never be installed over the released app")
 
-    return finish(args, debug_apk, release_apk)
+    return finish(args, debug_apk, release_apk, aapt)
 
 
-def finish(args: argparse.Namespace, debug_apk: pathlib.Path, release_apk: pathlib.Path) -> int:
+def finish(args: argparse.Namespace, debug_apk: pathlib.Path, release_apk: pathlib.Path, aapt: str | None = None) -> int:
     failed = [f"{name} ({detail})" for ok, name, detail in results if not ok]
     lines = [
         "UPI Expense Tracker beta APK verification",
@@ -293,6 +293,25 @@ def finish(args: argparse.Namespace, debug_apk: pathlib.Path, release_apk: pathl
             if apk.is_file():
                 entries.append(f"{sha256(apk)}  {apk.name}  # {label}, {size_of(apk)}")
         args.checksums.write_text("\n".join(entries) + "\n")
+
+    # Publish the verdict as a check-run annotation as well as the step summary: the annotation is the
+    # machine-readable record that survives outside the job log (which on some runners is not fetchable).
+    def escape(text: str) -> str:
+        return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+    if failed:
+        print(f"::error title=APK checks failed::{escape(' | '.join(failed))}", flush=True)
+    elif debug_apk.is_file():
+        badge = badging(aapt, debug_apk) if aapt else {}
+        print(
+            "::notice title=Beta APK verified::"
+            + escape(
+                f"version={badge.get('versionName')} versionCode={badge.get('versionCode')} "
+                f"package={badge.get('package')} minSdk={badge.get('sdkVersion')} internet=absent "
+                f"label={badge.get('label')} size={debug_apk.stat().st_size} sha256={sha256(debug_apk)}"
+            ),
+            flush=True,
+        )
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary and debug_apk.is_file():

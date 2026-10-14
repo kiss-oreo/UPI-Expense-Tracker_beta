@@ -69,9 +69,9 @@ jobs:
           set -o pipefail
           status=0
           ./gradlew --no-daemon :app:lint > gradle-lint.log 2>&1 || status=$?
-          python3 .github/scripts/lint_report.py
+          python3 .github/scripts/lint_report.py --annotate --out app/build/reports/lint-errors.txt
           if [ "$status" -ne 0 ]; then
-            echo "::error title=Lint failed::$(tail -n 40 gradle-lint.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
+            echo "::error title=Gradle lint output::$(tail -n 25 gradle-lint.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\n","%0A").replace("\r","%0D"))')"
           fi
           exit "$status"
       - name: Summarise unit tests
@@ -107,6 +107,8 @@ jobs:
           if summary:
               with open(summary, "a", encoding="utf-8") as handle:
                   handle.write("\n".join(lines) + "\n")
+          totals_line = next((line for line in lines if "tests" in line and "classes" in line), lines[-1])
+          print("::notice title=Unit tests::" + totals_line.replace("**", "").replace("·", "|"), flush=True)
           PY
       - name: Upload the debug test-copy APK
         uses: actions/upload-artifact@v4
