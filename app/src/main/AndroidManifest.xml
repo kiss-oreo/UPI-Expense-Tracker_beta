@@ -3,6 +3,11 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <!-- RECEIVE_SMS implies telephony hardware in the Play/ChromeOS feature model, which would falsely
+         limit installs to phones. SMS capture is optional here (manual entry and accessibility capture
+         both work without it), so the app declares telephony as NOT required and stays installable on
+         tablets/ChromeOS. Lint flags the permission without this tag (PermissionImpliesUnsupportedChromeOsHardware). -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- The app posts two notifications, and asks for this once, on Home (Android 13+):
          1. the "Payments aren't being recorded" reminder when capture is switched off (not opt-in, its own

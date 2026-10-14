@@ -81,12 +81,21 @@ object LocationSource {
         }
         val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
         val provider = pickProvider(lm)
-        try {
-            lm.getCurrentLocation(provider, null, ContextCompat.getMainExecutor(ctx)) { loc ->
-                val l = loc ?: freshestLastKnown(lm)
-                if (l != null) onResult(l.latitude, l.longitude)
+        // getCurrentLocation(provider, signal, executor, Consumer) is API 30+, and Android 10 (API 29) is
+        // this app's floor: there the overload does not exist and the call throws NoSuchMethodError — an
+        // *Error*, not an Exception, so the catch below would never have run and the map's "where am I"
+        // button would have crashed the app on the version the beta is tested against. On API 29 fall
+        // back to the cached fix the map already shows. (Found by :app:lint's NewApi check.)
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                lm.getCurrentLocation(provider, null, ContextCompat.getMainExecutor(ctx)) { loc ->
+                    val l = loc ?: freshestLastKnown(lm)
+                    if (l != null) onResult(l.latitude, l.longitude)
+                }
+            } catch (e: Exception) {
+                freshestLastKnown(lm)?.let { onResult(it.latitude, it.longitude) }
             }
-        } catch (e: Exception) {
+        } else {
             freshestLastKnown(lm)?.let { onResult(it.latitude, it.longitude) }
         }
     }
